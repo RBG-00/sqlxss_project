@@ -1,0 +1,7 @@
+--- Scanning: http://localhost:4000/vuln?q=abc (method=GET) ---
+[VULN] XSS on http://localhost:4000/vuln?q=abc param/key 'q' payload: <script>alert(1)</script> -- payload reflected in response; response length changed by 50.0%
+[VULN] XSS on http://localhost:4000/vuln?q=abc param/key 'q' payload: "><script>alert(1)</script> -- payload reflected in response; response length changed by 54.5%
+[VULN] XSS on http://localhost:4000/vuln?q=abc param/key 'q' payload: <img src=x onerror=alert(1)> -- payload reflected in response; response length changed by 56.8%
+
+--- Done. Scanned 1 target(s) in 0.0s. Findings: 3 ---
+Structured JSON report saved to report.json

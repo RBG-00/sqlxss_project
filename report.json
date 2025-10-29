@@ -1,0 +1,40 @@
+{
+  "generated_at": "2025-10-29T13:05:10.324088+00:00",
+  "targets_scanned": 1,
+  "findings_count": 3,
+  "findings": [
+    {
+      "timestamp": "2025-10-29T13:05:10.316466+00:00",
+      "url": "http://localhost:4000/vuln?q=abc",
+      "test_url": "http://localhost:4000/vuln?q=%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "<script>alert(1)</script>",
+      "vuln_type": "XSS",
+      "reason": "payload reflected in response; response length changed by 50.0%",
+      "status": 200
+    },
+    {
+      "timestamp": "2025-10-29T13:05:10.319937+00:00",
+      "url": "http://localhost:4000/vuln?q=abc",
+      "test_url": "http://localhost:4000/vuln?q=%22%3E%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "\"><script>alert(1)</script>",
+      "vuln_type": "XSS",
+      "reason": "payload reflected in response; response length changed by 54.5%",
+      "status": 200
+    },
+    {
+      "timestamp": "2025-10-29T13:05:10.323550+00:00",
+      "url": "http://localhost:4000/vuln?q=abc",
+      "test_url": "http://localhost:4000/vuln?q=%3Cimg+src%3Dx+onerror%3Dalert%281%29%3E",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "<img src=x onerror=alert(1)>",
+      "vuln_type": "XSS",
+      "reason": "payload reflected in response; response length changed by 56.8%",
+      "status": 200
+    }
+  ]
+}
