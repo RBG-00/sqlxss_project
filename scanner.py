@@ -5,6 +5,7 @@ MVP scanner (updated):
 - supports POST JSON bodies via --json '{"q":"test"}' and will inject payloads into top-level keys
 - writes human report.txt and structured report.json
 - Phase 2: argparse flags, timeout, headers-inject, inject-all-params, payloads file
+- Auto-verify: --auto-verify to confirm SQLi (boolean-based) & XSS (token reflection)
 """
 
 import argparse
@@ -31,6 +32,7 @@ SQL_ERR_RE = re.compile("|".join(SQL_ERR_PATTERNS), re.IGNORECASE)
 TIMEOUT = 10
 REPORT_FILE = "report.txt"
 REPORT_JSON = "report.json"
+AUTO_VERIFY = False  # toggled by --auto-verify
 
 # --- Helpers ---
 def now_ts():
@@ -51,7 +53,7 @@ def request_with_timeout(method, url, params=None, data=None, headers=None, json
         else:
             r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT, allow_redirects=True)
         return r
-    except Exception as e:
+    except Exception:
         return None
 
 def baseline_response(method, url, params=None, data=None, headers=None, json_body=None):
@@ -76,6 +78,83 @@ def length_change_ratio(base_text, new_text):
     if b == 0:
         return abs(n)
     return abs(n - b) / b
+
+# --- Auto-verification helpers ---
+def auto_verify_sqli(method, url, param_name, original_params, post_data, headers,
+                     json_body=None, json_key=None, base_text=""):
+    """
+    Simple boolean-based verification:
+    - true payload: OR '1'='1
+    - false payload: AND '1'='2
+    Returns True if responses differ materially.
+    """
+    true_p = "1' OR '1'='1"
+    false_p = "1' AND '1'='2"
+
+    if json_body is not None and json_key is not None:
+        jb_true = deepcopy(json_body); jb_true[json_key] = true_p
+        jb_false = deepcopy(json_body); jb_false[json_key] = false_p
+        r_true  = request_with_timeout(method, url, headers=headers, json_body=jb_true)
+        r_false = request_with_timeout(method, url, headers=headers, json_body=jb_false)
+    else:
+        parsed = urlparse(url)
+        p_true  = deepcopy(original_params)
+        p_false = deepcopy(original_params)
+        # if no param_name (we appended a synthetic one earlier)
+        key = param_name if param_name is not None else "_scantest"
+        p_true[key]  = [true_p]
+        p_false[key] = [false_p]
+        q_true  = urlencode({k: v[0] for k, v in p_true.items()},  doseq=False)
+        q_false = urlencode({k: v[0] for k, v in p_false.items()}, doseq=False)
+        url_true  = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, q_true,  parsed.fragment))
+        url_false = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, q_false, parsed.fragment))
+
+        if method.upper() == "POST" and post_data and param_name and (param_name in post_data):
+            pd_t = deepcopy(post_data); pd_t[param_name] = true_p
+            pd_f = deepcopy(post_data); pd_f[param_name] = false_p
+            r_true  = request_with_timeout("POST", url, data=pd_t, headers=headers)
+            r_false = request_with_timeout("POST", url, data=pd_f, headers=headers)
+        else:
+            r_true  = request_with_timeout("GET" if method.upper()=="GET" else "POST", url_true,  data=post_data, headers=headers)
+            r_false = request_with_timeout("GET" if method.upper()=="GET" else "POST", url_false, data=post_data, headers=headers)
+
+    if not r_true or not r_false:
+        return False
+
+    # heuristic compare
+    len_diff = abs(len(r_true.text) - len(r_false.text))
+    if len_diff > max(30, int(len(base_text) * 0.03)) or r_true.text != r_false.text or r_true.status_code != r_false.status_code:
+        return True
+    return False
+
+def auto_verify_xss(method, url, param_name, original_params, post_data, headers, json_body=None, json_key=None):
+    """
+    Injects a unique token payload and checks for unescaped reflection.
+    """
+    token = f"INJ_TOKEN_{int(time.time())}"
+    payload = f"<script>console.log('{token}')</script>"
+
+    if json_body is not None and json_key is not None:
+        jb = deepcopy(json_body); jb[json_key] = payload
+        r = request_with_timeout(method, url, headers=headers, json_body=jb)
+    else:
+        parsed = urlparse(url)
+        params_copy = deepcopy(original_params)
+        key = param_name if param_name is not None else "_scantest"
+        params_copy[key] = [payload]
+        q = urlencode({k: v[0] for k, v in params_copy.items()}, doseq=False)
+        new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, q, parsed.fragment))
+        if method.upper() == "POST" and post_data and param_name and (param_name in post_data):
+            pd = deepcopy(post_data); pd[param_name] = payload
+            r = request_with_timeout("POST", url, data=pd, headers=headers)
+        else:
+            r = request_with_timeout("GET" if method.upper()=="GET" else "POST", new_url, data=post_data, headers=headers)
+
+    if not r:
+        return False
+    text = r.text or ""
+    # Unescaped reflection or token presence
+    return (payload in text) or (token in text)
 
 # --- Header variants helper (for headers-inject) ---
 def generate_header_variants(base_headers, payloads):
@@ -110,8 +189,7 @@ def inject_and_test(method, url, param_name, original_params, base_text, base_st
             test_url = url
         else:
             params_copy = deepcopy(original_params)
-            # parse_qs style lists -> use first element for building query
-            params_copy[param_name] = [payload]
+            params_copy[param_name] = [payload]  # parse_qs style
             parsed = urlparse(url)
             query = urlencode({k: v[0] for k, v in params_copy.items()}, doseq=False)
             new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
@@ -154,6 +232,24 @@ def inject_and_test(method, url, param_name, original_params, base_text, base_st
             reason.append(f"response length changed by {len_ratio*100:.1f}%")
 
         if vuln_type:
+            # auto-verification (optional)
+            verified = False
+            if AUTO_VERIFY:
+                try:
+                    if vuln_type == "SQLi":
+                        verified = auto_verify_sqli(method, url, param_name, original_params, post_data, headers,
+                                                    json_body=json_body, json_key=json_key, base_text=base_text)
+                    elif vuln_type == "XSS":
+                        verified = auto_verify_xss(method, url, param_name, original_params, post_data, headers,
+                                                   json_body=json_body, json_key=json_key)
+                    else:
+                        # if generic possible injection & reflected, try xss verify as a hint
+                        if any("reflected" in r for r in reason):
+                            verified = auto_verify_xss(method, url, param_name, original_params, post_data, headers,
+                                                       json_body=json_body, json_key=json_key)
+                except Exception:
+                    verified = False
+
             finding = {
                 "timestamp": now_ts(),
                 "url": url,
@@ -163,10 +259,13 @@ def inject_and_test(method, url, param_name, original_params, base_text, base_st
                 "payload": payload,
                 "vuln_type": vuln_type,
                 "reason": "; ".join(reason),
-                "status": status
+                "status": status,
+                "auto_verified": bool(verified)
             }
             findings.append(finding)
             msg = f"[VULN] {finding['vuln_type']} on {finding['url']} param/key '{finding['injected_param']}' payload: {payload} -- {finding['reason']}"
+            if finding["auto_verified"]:
+                msg += " [AUTO-VERIFIED]"
             log(msg)
         else:
             if verbose:
@@ -202,7 +301,8 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
                 "payload": payload,
                 "vuln_type": "Possible Multi-Param Injection" if not sqlerr else "SQLi",
                 "reason": f"all params set to payload; sqlerr={sqlerr}; len_change={len_ratio:.2f}",
-                "status": status
+                "status": status,
+                "auto_verified": False
             }
             findings.append(finding)
             log(f"[VULN] Multi-param {finding['vuln_type']} on {url} payload: {payload} -- {finding['reason']}")
@@ -322,16 +422,18 @@ def build_argparser():
     parser.add_argument('--report-json', default='report.json', help='Path to structured JSON report')
     parser.add_argument('--report-txt', default='report.txt', help='Path to human-readable report')
     parser.add_argument('--max-workers', type=int, default=1, help='Concurrency (1 = sequential, >1 = ThreadPool) - not used in this simple build')
+    parser.add_argument('--auto-verify', action='store_true', help='Run simple auto-verification (boolean for SQLi, token reflect for XSS)')
     return parser
 
 def main():
-    global TIMEOUT, REPORT_FILE, REPORT_JSON
+    global TIMEOUT, REPORT_FILE, REPORT_JSON, AUTO_VERIFY
     parser = build_argparser()
     args = parser.parse_args()
 
     TIMEOUT = args.timeout
     REPORT_FILE = args.report_txt
     REPORT_JSON = args.report_json
+    AUTO_VERIFY = bool(args.auto_verify)
 
     # prepare headers
     hdrs = {}
@@ -349,7 +451,6 @@ def main():
             combined_payloads = pl
             if args.verbose:
                 log(f"[*] Loaded {len(pl)} payloads from {args.payloads}")
-    # if no custom payloads use defaults (combination)
     if combined_payloads is None:
         combined_payloads = SQL_PAYLOADS + XSS_PAYLOADS
 
@@ -382,7 +483,12 @@ def main():
     # write structured JSON report
     try:
         with open(REPORT_JSON, "w", encoding="utf-8") as jf:
-            _json.dump({"generated_at": now_ts(), "targets_scanned": len(targets), "findings_count": len(all_findings), "findings": all_findings}, jf, indent=2, ensure_ascii=False)
+            _json.dump({
+                "generated_at": now_ts(),
+                "targets_scanned": len(targets),
+                "findings_count": len(all_findings),
+                "findings": all_findings
+            }, jf, indent=2, ensure_ascii=False)
         if all_findings:
             log(f"Structured JSON report saved to {REPORT_JSON}")
     except Exception as e:
