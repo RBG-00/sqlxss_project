@@ -1,0 +1,116 @@
+# test_server.py
+# Simple Flask test server for scanner auto-verify experiments.
+# Usage: pip install flask; python3 test_server.py
+from flask import Flask, request, jsonify, make_response
+import time
+import html
+
+app = Flask(__name__)
+
+# Helper: simulate DB error message
+def sql_error_message():
+    return "you have an error in your SQL syntax near '...'"
+
+
+@app.route("/echo", methods=["GET"])
+def echo_get():
+    # Reflect q param (useful for XSS reflection tests)
+    q = request.args.get("q", "")
+    body = f"Echo: {html.escape(q)}"
+    return make_response(body, 200)
+
+@app.route("/vuln/sql", methods=["GET","POST"])
+def vuln_sql():
+    """
+    Simulates various SQLi behaviors:
+    - If payload contains "pg_sleep" or "SLEEP(" -> simulate time-based by sleeping for 3s
+    - If payload contains "OR '1'='1" -> simulate boolean-true by returning different content
+    - If payload contains "ERROR_TRIGGER" or unmatched quotes -> return SQL error text
+    - Otherwise return normal content
+    """
+    payload = ""
+    if request.method == "POST":
+        # prefer form post, but accept json / raw
+        if request.form:
+            payload = " ".join([v for v in request.form.values()])
+        else:
+            try:
+                payload = request.get_data(as_text=True) or ""
+            except Exception:
+                payload = ""
+    else:
+        payload = request.args.get("q", "")
+
+    p = payload.lower()
+
+    # time-based trigger
+    if "pg_sleep" in p or "sleep(" in p:
+        # simulate DB sleep
+        time.sleep(3)
+        return make_response("OK (slept)", 200)
+
+    # boolean-based simulation
+    if "or '1'='1" in p or 'or "1"="1' in p or "or 1=1" in p:
+        return make_response("RESULTS: all rows (boolean-true)", 200)
+    if "and '1'='2" in p or "and 1=2" in p:
+        return make_response("RESULTS: no rows (boolean-false)", 200)
+
+    # error-simulation: unmatched quote or explicit token
+    if ("'" in p and p.count("'") % 2 == 1) or "error_trigger" in p:
+        return make_response(f'{{"error": {{"message": "{sql_error_message()}"}}}}', 200)
+
+    # default
+    return make_response(f"normal search results for: {html.escape(payload)}", 200)
+
+@app.route("/vuln/xss", methods=["GET","POST"])
+def vuln_xss():
+    # Reflect payload without escaping -> simulate vulnerable reflection (XSS)
+    payload = ""
+    if request.method == "POST":
+        if request.form:
+            payload = " ".join([v for v in request.form.values()])
+        else:
+            try:
+                payload = request.get_data(as_text=True) or ""
+            except Exception:
+                payload = ""
+    else:
+        payload = request.args.get("q", "")
+    # intentionally return payload unescaped to simulate vulnerable app
+    body = f"<html><body>User input: {payload}</body></html>"
+    return make_response(body, 200)
+
+@app.route("/rest/user/login", methods=["POST"])
+def fake_login():
+    # Accepts form-urlencoded or json; simulate normal auth behavior
+    if request.form:
+        email = request.form.get("email", "")
+        pwd = request.form.get("password", "")
+    else:
+        data = {}
+        try:
+            data = request.get_json(silent=True) or {}
+        except Exception:
+            data = {}
+        email = data.get("email", "")
+        pwd = data.get("password", "")
+
+    # Very simple logic: if password contains "sleep" -> delay; if contains "OR '1'='1" -> return success
+    p = (email + " " + pwd).lower()
+    if "pg_sleep" in p or "sleep(" in p:
+        time.sleep(3)
+        return jsonify({"status": "ok", "note": "delayed"}), 200
+    if "or '1'='1" in p or 'or "1"="1' in p:
+        return jsonify({"status": "ok", "user": email}), 200
+    # simulate SQL error if odd number of single quotes
+    if "'" in p and p.count("'") % 2 == 1:
+        return make_response(f'{{"error": {{"message": "{sql_error_message()}"}}}}', 200)
+    return jsonify({"status": "failed", "message": "invalid credentials"}), 401
+
+@app.route("/", methods=["GET"])
+def index():
+    return "Test server is running. Endpoints: /echo?q=, /vuln/sql, /vuln/xss, /rest/user/login"
+
+if __name__ == "__main__":
+    print("Starting test_server on http://127.0.0.1:8080")
+    app.run(host="127.0.0.1", port=8080, debug=False)

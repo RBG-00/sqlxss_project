@@ -1,0 +1,6 @@
+{
+  "boolean": ["' OR '1'='1", "\" OR \"1\"=\"1", " OR 1=1--"],
+  "time": ["'; SELECT pg_sleep(2); --", "\"; SELECT pg_sleep(2); --"],
+  "error": ["' ; --", "ERROR_TRIGGER"],
+  "xss": ["<script>alert(1)</script>"]
+}
