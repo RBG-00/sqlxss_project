@@ -28,6 +28,22 @@ jobs:
       run: |
         python -m compileall .
 
-    - name: Run scanner help
+    # ---------- Phase 5 additions ----------
+    - name: Crawl target website
+      env:
+        TARGET_URL: ${{ secrets.SCAN_TARGET_URL }}   # ضع عنوان الهدف هنا داخل secrets
       run: |
-        python scanner.py -h || true
+        mkdir -p reports
+        python crawler.py --start-url "${TARGET_URL}" --max-depth 2 --rate 1 \
+          --out-json reports/targets.json --out-list reports/targets.txt
+
+    - name: Run scanner on discovered URLs
+      run: |
+        python scanner.py --file reports/targets.txt --threads 4 --delay 0.2 \
+          --report-json reports/report.json --report-txt reports/report.txt --auto-verify
+
+    - name: Upload reports artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-reports
+        path: reports/

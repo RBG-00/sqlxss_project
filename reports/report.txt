@@ -1,0 +1,3 @@
+--- Scanning: http://localhost:3000 (method=GET) ---
+[OK] No issues detected (basic heuristics) for: http://localhost:3000
+Scan finished in 1.90s. Findings: 0

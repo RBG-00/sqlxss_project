@@ -23,6 +23,6 @@ flake8>=6.1.0           # تحليل جودة الكود
 
 
 
-beautifulsoup4
+beautifulsoup4>=4.12
 lxml
 playwright

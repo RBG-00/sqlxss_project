@@ -1,6 +1,337 @@
 {
-  "generated_at": "2025-10-30T15:33:13.323957+00:00",
+  "generated_at": "2025-12-10T23:07:59.816929+00:00",
   "targets_scanned": 1,
-  "findings_count": 0,
-  "findings": []
+  "findings_count": 11,
+  "findings": [
+    {
+      "timestamp": "2025-12-10T23:07:59.564725+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%27",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "'",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.589356+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%22",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "\"",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 1363.5%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 7809
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.595932+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%27+OR+%271%27%3D%271",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "' OR '1'='1",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 2401.7%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 13639
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.614870+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%22+OR+%221%22%3D%221",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "\" OR \"1\"=\"1",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.648815+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=+OR+1%3D1--",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": " OR 1=1--",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.685286+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "<script>alert(1)</script>",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.705642+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%22%3E%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "\"><script>alert(1)</script>",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.712285+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%3Cimg+src%3Dx+onerror%3Dalert%281%29%3E",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "<img src=x onerror=alert(1)>",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.741147+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%22%3Balert%281%29%3B%2F%2F",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "\";alert(1);//",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.782913+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%3C%2Fscript%3E%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "</script><script>alert(1)</script>",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    },
+    {
+      "timestamp": "2025-12-10T23:07:59.794595+00:00",
+      "url": "http://localhost:3000/rest/products/search?q=test",
+      "test_url": "http://localhost:3000/rest/products/search?q=%22+autofocus+onfocus%3Dalert%281%29+x%3D%22",
+      "method": "GET",
+      "injected_param": "q",
+      "payload": "\" autofocus onfocus=alert(1) x=\"",
+      "vuln_type": "Possible Injection",
+      "reason": "response length changed by 93.6%",
+      "status_code": 200,
+      "auto_verified": false,
+      "verify": {
+        "verified": false,
+        "evidence": "no specific verify",
+        "score_delta": 0,
+        "elapsed": 0.0
+      },
+      "fingerprint": {
+        "server": null,
+        "language": "php",
+        "database": null,
+        "evidence": [
+          "language:php matched /\\bphp\\b/"
+        ]
+      },
+      "score": 15,
+      "status": "low",
+      "base_len": 471,
+      "resp_len": 30
+    }
+  ]
 }

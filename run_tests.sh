@@ -26,7 +26,7 @@ sleep $SLEEP_SHORT
 # wait up to N seconds for server to bind (simple check)
 echo "Waiting for test_server to start (checking / )..."
 for i in $(seq 1 10); do
-  if curl -sSf --max-time 1 http://127.0.0.1:8080/ >/dev/null 2>&1; then
+  if curl -sSf --max-time 1 http://127.0.0.1:3000/ >/dev/null 2>&1; then
     echo "test_server is up (after ${i} attempts)."
     break
   fi
@@ -46,15 +46,15 @@ fi
 echo
 echo "Running scanner integration checks against test_server..."
 # 1) XSS endpoint (reflection) — should be auto-verified by scanner
-$PY scanner.py -u "http://127.0.0.1:8080/vuln/xss?q=test" --auto-verify --timeout 8 --len-threshold 0.2 --verbose || true
+$PY scanner.py -u "http://127.0.0.1:3000/vuln/xss?q=test" --auto-verify --timeout 8 --len-threshold 0.2 --verbose || true
 sleep $SLEEP_SHORT
 
 # 2) SQL endpoint (boolean/time) — should be auto-verified by scanner
-$PY scanner.py -u "http://127.0.0.1:8080/vuln/sql?q=test" --auto-verify --timeout 12 --len-threshold 0.2 --verbose || true
+$PY scanner.py -u "http://127.0.0.1:3000/vuln/sql?q=test" --auto-verify --timeout 12 --len-threshold 0.2 --verbose || true
 sleep $SLEEP_SHORT
 
 # 3) Login POST (form) endpoint — exercise POST flow and JSON form handling
-$PY scanner.py -u "http://127.0.0.1:8080/rest/user/login" -m POST \
+$PY scanner.py -u "http://127.0.0.1:3000/rest/user/login" -m POST \
   --postdata "email=foo&password=1' OR '1'='1" \
   --headers "Content-Type: application/x-www-form-urlencoded|Accept: application/json" \
   --auto-verify --timeout 12 --verbose || true
