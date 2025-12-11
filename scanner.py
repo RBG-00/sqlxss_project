@@ -2054,23 +2054,24 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     except Exception as e:
         if verbose:
             log(f"[DEBUG] Advanced reflected XSS phase error on {url}: {e}")
-            # --- Phase 10: DOM-based XSS static detection ---
+                # --- Phase 10: DOM-based XSS static detection ---
     try:
+        dom_findings = []   # <-- ضيف هاي
+
         if dom_xss:
             dom_findings = run_dom_xss_phase(
                 url=url,
                 method=method,
                 base_text=base_text_raw,
                 verbose=verbose
-        )
+            )
+
         if dom_findings:
             findings_total.extend(dom_findings)
+
     except Exception as e:
         if verbose:
             log(f"[DEBUG] DOM XSS phase error on {url}: {e}")
-
-
-
   
     tasks = []
 
