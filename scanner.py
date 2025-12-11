@@ -1877,17 +1877,34 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
     return findings
 
 # --- High level scanning for a single target (Phase 3 concurrency inside) ---
-def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=None,
-                headers_inject=False, inject_all_params_flag=False, combined_payloads=None,
-                verbose=False, threads=1, payloads_categories=None,
-                time_sqli=False, time_delay=5, time_threshold=4.0, time_samples=3,
-                union_extract=False, xss_context=False, active_fp=False,
-                xss_advanced=False, dom_xss=False):  # <-- NEW: dom_xss
+def scan_target(
+    url,
+    method="GET",
+    postdata_str=None,
+    headers=None,
+    json_str=None,
+    headers_inject=False,
+    inject_all_params_flag=False,
+    combined_payloads=None,
+    verbose=False,
+    threads=1,
+    payloads_categories=None,
+    time_sqli=False,
+    time_delay=5,
+    time_threshold=4.0,
+    time_samples=3,
+    union_extract=False,
+    xss_context=False,
+    active_fp=False,
+    xss_advanced=False,
+    dom_xss=False  # <-- NEW: dom_xss flag
+):
     log(f"--- Scanning: {url} (method={method}) ---")
 
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
 
+    # --- Parse POST data (if provided as key1=val1&key2=val2) ---
     post_data = None
     if postdata_str:
         post_data = {}
@@ -1896,6 +1913,7 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
                 k, v = kv.split("=", 1)
                 post_data[k] = v
 
+    # --- Parse JSON body (if provided) ---
     json_body = None
     if json_str:
         try:
@@ -1903,6 +1921,7 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
         except Exception as e:
             log(f"[ERROR] bad --json for {url}: {e}")
 
+    # --- Baseline response ---
     base_status, base_text_raw, base_headers = baseline_response(
         method,
         url,
@@ -1916,7 +1935,7 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
 
     base_text = normalize_response(base_text_raw)  # (4) استخدم المنقّى كأساس
 
-    # Phase 4: fingerprint & tuned payloads
+    # --- Phase 4: fingerprint & tuned payloads ---
     fingerprint = fingerprint_response(base_text_raw, base_headers)
     if verbose:
         log(f"[INFO] Fingerprint for {url}: {fingerprint}")
@@ -1924,7 +1943,13 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     # --- NEW: Active DB fingerprinting phase ---
     try:
         if active_fp and params:
-            db_guess, ev = active_db_fingerprint(method, url, params, headers=headers, verbose=verbose)
+            db_guess, ev = active_db_fingerprint(
+                method,
+                url,
+                params,
+                headers=headers,
+                verbose=verbose
+            )
             if db_guess:
                 old_db = fingerprint.get("database")
                 fingerprint["database"] = db_guess
@@ -1935,6 +1960,7 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
         if verbose:
             log(f"[DEBUG] Active fingerprinting error on {url}: {e}")
 
+    # --- Payload selection ---
     if combined_payloads:
         payloads = combined_payloads
     elif payloads_categories:
@@ -1944,14 +1970,15 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     else:
         payloads = choose_payloads(fingerprint)
 
-    # Findings list
+    # --- Findings container ---
     findings_total = []
 
-    # --- NEW: Phase 10: DOM-based XSS Static Detection ---
+    # --- Phase 10: DOM-based XSS Static Detection (single place, no duplication) ---
     try:
-        if dom_xss and base_text_raw and base_headers:
-            ctype = base_headers.get("Content-Type", "")
-            if "text/html" in ctype.lower():
+        if dom_xss and base_text_raw:
+            ctype = (base_headers or {}).get("Content-Type", "")
+            # نسمح بالحالتين: header فيه text/html أو وجود <html> في البودي
+            if "text/html" in ctype.lower() or "<html" in base_text_raw.lower():
                 dom_findings = run_dom_xss_phase(
                     url=url,
                     html=base_text_raw,
@@ -1993,7 +2020,12 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     try:
         if time_sqli and params:
             tb_findings = run_time_based_sqli_phase(
-                method, url, params, headers, json_body, post_data,
+                method,
+                url,
+                params,
+                headers,
+                json_body,
+                post_data,
                 fingerprint,
                 time_delay=time_delay,
                 time_threshold=time_threshold,
@@ -2010,7 +2042,12 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     try:
         if union_extract and params:
             union_findings = run_union_extraction_phase(
-                method, url, params, headers, json_body, post_data,
+                method,
+                url,
+                params,
+                headers,
+                json_body,
+                post_data,
                 fingerprint,
                 base_status=base_status,
                 base_text_raw=base_text_raw,
@@ -2026,7 +2063,10 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     try:
         if xss_context and params:
             ctx_findings = run_context_aware_xss_phase(
-                method, url, params, headers,
+                method,
+                url,
+                params,
+                headers,
                 json_body=json_body,
                 post_data=post_data,
                 base_status=base_status,
@@ -2044,7 +2084,10 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     try:
         if xss_advanced and params:
             adv_xss_findings = run_advanced_reflected_xss_phase(
-                method, url, params, headers,
+                method,
+                url,
+                params,
+                headers,
                 base_text_raw=base_text_raw,
                 fingerprint=fingerprint,
                 verbose=verbose
@@ -2054,26 +2097,15 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     except Exception as e:
         if verbose:
             log(f"[DEBUG] Advanced reflected XSS phase error on {url}: {e}")
-                # --- Phase 10: DOM-based XSS static detection ---
-    try:
-        dom_findings = []   # <-- ضيف هاي
 
-        if dom_xss:
-            dom_findings = run_dom_xss_phase(
-                url=url,
-                method=method,
-                base_text=base_text_raw,
-                verbose=verbose
-            )
-
-        if dom_findings:
-            findings_total.extend(dom_findings)
-
-    except Exception as e:
-        if verbose:
-            log(f"[DEBUG] DOM XSS phase error on {url}: {e}")
-  
+    # باقي السكّنر (tasks/concurrency إلخ) يكمّل هنا
     tasks = []
+
+    # ... بقية منطق السكّنر (threads, per-param injection, headers_inject, inject_all_params_flag, إلخ)
+
+    return findings_total
+
+
 
     # Build header variants list
     header_variants = [headers] if headers is not None else [None]
