@@ -1981,15 +1981,18 @@ def scan_target(
             if "text/html" in ctype.lower() or "<html" in base_text_raw.lower():
                 dom_findings = run_dom_xss_phase(
                     url=url,
-                    html=base_text_raw,
+                    base_html=base_text_raw,  # <-- هنا عدلنا الاسم
+                    headers=headers,
                     fingerprint=fingerprint,
                     verbose=verbose
                 )
                 if dom_findings:
                     for f in dom_findings:
+                        extra = f.get("extra") or {}
                         log(
-                            f"[DOM-XSS] {url} pattern={f.get('pattern')} "
-                            f"context={f.get('context')} (score={f.get('score')})"
+                            f"[DOM-XSS] {url} script={extra.get('dom_script_id')} "
+                            f"line={extra.get('dom_line_no')} sources={extra.get('dom_sources')} "
+                            f"sinks={extra.get('dom_sinks')} (score={f.get('score')})"
                         )
                     findings_total.extend(dom_findings)
     except Exception as e:
@@ -2098,12 +2101,98 @@ def scan_target(
         if verbose:
             log(f"[DEBUG] Advanced reflected XSS phase error on {url}: {e}")
 
-    # باقي السكّنر (tasks/concurrency إلخ) يكمّل هنا
+    # --- Build header variants list ---
+    header_variants = [headers] if headers is not None else [None]
+    if headers_inject:
+        header_variants = generate_header_variants(headers, payloads)
+
+    # --- Build tasks (each task = one payload injection attempt) ---
     tasks = []
 
-    # ... بقية منطق السكّنر (threads, per-param injection, headers_inject, inject_all_params_flag, إلخ)
+    def add_param_payload_tasks(hdr, p_name, orig_params, jb=None, jkey=None):
+        for pl in payloads:
+            tasks.append((
+                "param",
+                dict(
+                    method=method,
+                    url=url,
+                    param_name=p_name,
+                    original_params=orig_params,
+                    base_text=base_text,
+                    base_status=base_status,
+                    payload=pl,
+                    post_data=post_data,
+                    headers=hdr,
+                    json_body=jb,
+                    json_key=jkey,
+                    verbose=verbose,
+                    fingerprint=fingerprint
+                )
+            ))
+
+    for hdr in header_variants:
+        if json_body:
+            for key in list(json_body.keys()):
+                add_param_payload_tasks(hdr, None, {}, jb=json_body, jkey=key)
+        else:
+            if params:
+                for pname in params.keys():
+                    add_param_payload_tasks(hdr, pname, params)
+                if inject_all_params_flag:
+                    tasks.append((
+                        "allparams",
+                        dict(
+                            method=method,
+                            url=url,
+                            params=params,
+                            payloads=payloads,
+                            base_text=base_text,
+                            base_status=base_status,
+                            post_data=post_data,
+                            headers=hdr,
+                            verbose=verbose,
+                            fingerprint=fingerprint
+                        )
+                    ))
+            else:
+                test_param = "_scntest"
+                add_param_payload_tasks(hdr, test_param, {test_param: ["1"]})
+
+    # --- Execute tasks concurrently (Phase 3) ---
+    max_workers = max(1, int(threads or 1))
+    if max_workers == 1:
+        for kind, kwargs in tasks:
+            if kind == "param":
+                f = _single_injection_attempt(**kwargs)
+                if f:
+                    findings_total.append(f)
+            else:
+                findings_total.extend(test_inject_all_params(**kwargs))
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = []
+            for kind, kwargs in tasks:
+                if kind == "param":
+                    futures.append(ex.submit(_single_injection_attempt, **kwargs))
+                else:
+                    futures.append(ex.submit(test_inject_all_params, **kwargs))
+            for fut in as_completed(futures):
+                try:
+                    res = fut.result()
+                    if isinstance(res, list):
+                        findings_total.extend(res)
+                    elif res:
+                        findings_total.append(res)
+                except Exception as e:
+                    if verbose:
+                        log(f"[DEBUG] task error: {e}")
+
+    if not findings_total:
+        log(f"[OK] No issues detected (basic heuristics) for: {url}")
 
     return findings_total
+
+  
 
 
 
@@ -2532,28 +2621,33 @@ def main():
                     break
                 except Exception as e:
                     log(f"[DEBUG] target error: {e}")
-    else:
-        for t in targets:
-            try:
-                f = scan_target(
-                    t, method=args.method, postdata_str=args.postdata, headers=hdrs, json_str=args.json,
-                    headers_inject=args.headers_inject, inject_all_params_flag=args.inject_all_params,
-                    combined_payloads=combined_payloads, verbose=args.verbose, threads=args.threads,
-                    payloads_categories=payloads_categories,
-                    time_sqli=args.time_sqli, time_delay=args.time_delay,
-                    time_threshold=args.time_threshold, time_samples=args.time_samples,
-                    union_extract=args.union_extract,
-                    xss_context=args.xss_context,
-                    active_fp=args.active_fp,
-                    xss_advanced=args.xss_advanced
-                )
-                all_findings.extend(f)
-            except KeyboardInterrupt:
-                print("Interrupted by user")
-                break
+   else:
+    for t in targets:
+        try:
+            f = scan_target(
+                t,
+                method=args.method,
+                postdata_str=args.postdata,
+                headers=hdrs,
+                json_str=args.json,
+                headers_inject=args.headers_inject,
+                inject_all_params_flag=args.inject_all_params,
+                combined_payloads=combined_payloads,
+                verbose=args.verbose,
+                threads=args.threads,
+                payloads_categories=payloads_categories,
+                time_sqli=args.time_sqli,
+                time_delay=args.time_delay,
+                time_threshold=args.time_threshold,
+                time_samples=args.time_samples,
+                union_extract=args.union_extract,
+                xss_context=args.xss_context,
+                active_fp=args.active_fp,
+                xss_advanced=args.xss_advanced,
+                dom_xss=args.dom_xss   
+            )
+            all_findings.extend(f or [])
 
-    # إزالة التكرارات (مهم بعد إضافة Phase 8 + Phase 9)
-    all_findings = dedupe_findings(all_findings)
 
     elapsed = time.time() - start
     log(f"Scan finished in {elapsed:.2f}s. Findings: {len(all_findings)}")
