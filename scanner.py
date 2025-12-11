@@ -582,6 +582,210 @@ def run_advanced_reflected_xss_phase(method, url, params, headers, base_text_raw
 
     return findings
 
+
+# --- Phase 10: DOM-based XSS (static JS analysis) ---
+
+# مصادر input في الـ DOM (potentially attacker-controlled)
+DOM_XSS_SOURCES = [
+    r"location\.hash",
+    r"location\.search",
+    r"location\.href",
+    r"document\.URL",
+    r"document\.documentURI",
+    r"document\.referrer",
+    r"localStorage",
+    r"sessionStorage",
+    r"window\.name"
+]
+
+# sinks خطيرة في الـ DOM (أماكن التنفيذ/الحقن)
+DOM_XSS_SINKS = [
+    r"innerHTML",
+    r"outerHTML",
+    r"document\.write",
+    r"document\.writeln",
+    r"insertAdjacentHTML",
+    r"eval\(",
+    r"setTimeout\(",
+    r"setInterval\(",
+    r"Function\(",
+    r"\.html\("          # jQuery html()
+]
+
+DOM_SRC_RES = [re.compile(p) for p in DOM_XSS_SOURCES]
+DOM_SINK_RES = [re.compile(p) for p in DOM_XSS_SINKS]
+
+def _analyze_js_for_dom_xss(js_code: str, script_id: str, script_url: str = None):
+    """
+    يحلل كود JavaScript بشكل static:
+    - يدور على line تحتوي source + sink معاً
+    - heuristic بسيط بس مفيد كبداية
+    يرجّع list من findings الخام (قبل ما تتحول لـ scanner finding).
+    """
+    results = []
+    if not js_code:
+        return results
+
+    lines = js_code.splitlines()
+    for idx, line in enumerate(lines, start=1):
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+
+        has_src = []
+        has_sink = []
+
+        for sre in DOM_SRC_RES:
+            if sre.search(line_stripped):
+                has_src.append(sre.pattern)
+
+        for kre in DOM_SINK_RES:
+            if kre.search(line_stripped):
+                has_sink.append(kre.pattern)
+
+        if has_src and has_sink:
+            results.append({
+                "script_id": script_id,
+                "script_url": script_url,
+                "line_no": idx,
+                "line": line_stripped[:300],
+                "sources": has_src,
+                "sinks": has_sink
+            })
+
+    return results
+
+def _collect_scripts_from_html(base_url: str, html_text: str, headers=None):
+    """
+    يجمع:
+    - inline <script> contents
+    - external JS من <script src="...">
+    ويرجّع list من {code, id, url}
+    """
+    scripts = []
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+    except Exception:
+        return scripts
+
+    # 1) inline scripts
+    inline_idx = 0
+    for s in soup.find_all("script"):
+        src = s.get("src")
+        if src:
+            continue  # الخارجية بنجيبها تحت
+        code = s.string or ""
+        if not code or not code.strip():
+            continue
+        inline_idx += 1
+        scripts.append({
+            "code": code,
+            "id": f"inline_{inline_idx}",
+            "url": None
+        })
+
+    # 2) external scripts
+    for s in soup.find_all("script", src=True):
+        src = s.get("src")
+        if not src:
+            continue
+        js_url = urljoin(base_url, src)
+        try:
+            resp = requests.get(js_url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+        except Exception:
+            continue
+        if not resp or resp.status_code != 200:
+            continue
+        code = resp.text or ""
+        if not code.strip():
+            continue
+        scripts.append({
+            "code": code,
+            "id": f"external::{src}",
+            "url": js_url
+        })
+
+    return scripts
+
+def run_dom_xss_phase(url, base_html, headers=None, fingerprint=None, verbose=False):
+    """
+    Phase 10 — DOM-based XSS (static analysis):
+    - يحلل كل سكربت (inline + external) في الصفحة
+    - لو سطر يحتوي مصدر + sink → potential DOM XSS
+    - output بنفس فورمات الفايندينغز في باقي الفيزات
+    """
+    findings = []
+    if not base_html:
+        return findings
+
+    scripts = _collect_scripts_from_html(url, base_html, headers=headers)
+    if not scripts:
+        return findings
+
+    for sc in scripts:
+        code = sc["code"]
+        sid = sc["id"]
+        surl = sc["url"]
+
+        raw_hits = _analyze_js_for_dom_xss(code, sid, script_url=surl)
+        for h in raw_hits:
+            reason = (
+                "Potential DOM-based XSS: source(s) "
+                + ", ".join(h["sources"])
+                + " flowing into sink(s) "
+                + ", ".join(h["sinks"])
+                + f" at line {h['line_no']} in script {h['script_id']}"
+            )
+
+            verify_result = {
+                "verified": False,
+                "evidence": "static JS pattern (source→sink) only",
+                "score_delta": 0,
+                "elapsed": 0.0
+            }
+
+            score = compute_score(
+                base_confidence=35,
+                fingerprint=fingerprint,
+                verify_result=verify_result,
+                payload=None
+            )
+
+            finding = {
+                "timestamp": now_ts(),
+                "url": url,
+                "test_url": url,
+                "method": "GET",
+                "injected_param": "[DOM_ANALYSIS]",
+                "payload": "[DOM_ANALYSIS]",
+                "vuln_type": "DOM XSS (client-side)",
+                "reason": reason,
+                "status_code": None,
+                "auto_verified": False,
+                "verify": verify_result,
+                "fingerprint": fingerprint or {},
+                "score": score,
+                "status": "probable" if score >= 30 else "low",
+                "base_len": len(base_html or ""),
+                "resp_len": len(base_html or ""),
+                "extra": {
+                    "dom_script_id": h["script_id"],
+                    "dom_script_url": h["script_url"],
+                    "dom_line_no": h["line_no"],
+                    "dom_line_snippet": h["line"],
+                    "dom_sources": h["sources"],
+                    "dom_sinks": h["sinks"]
+                }
+            }
+
+            if verbose:
+                log(f"[DOM-XSS] {url} script={h['script_id']} line={h['line_no']} sources={h['sources']} sinks={h['sinks']}")
+
+            findings.append(finding)
+
+    return findings
+
+
 # --- Phase 2: Time-based SQLi helpers ---
 
 def _pick_db_key_from_fingerprint(fp):
@@ -2068,6 +2272,9 @@ def build_argparser():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--url", "-u", help="Base target URL to scan (can be combined with --crawl)")
     group.add_argument("--file", help="File with list of target URLs (one per line)")
+
+    # Phase 10 Dom xss flags:
+    parser.add_argument('--dom-xss', action='store_true',help='Enable DOM-based XSS static detection (Phase 10)')
 
     parser.add_argument("--method", "-m", choices=["GET","POST"], default="GET", help="HTTP method (default GET)")
     parser.add_argument("--postdata", default=None, help="POST data as key=value&k2=v2")
