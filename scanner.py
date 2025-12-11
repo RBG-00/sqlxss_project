@@ -1882,7 +1882,7 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
                 verbose=False, threads=1, payloads_categories=None,
                 time_sqli=False, time_delay=5, time_threshold=4.0, time_samples=3,
                 union_extract=False, xss_context=False, active_fp=False,
-                xss_advanced=False):
+                xss_advanced=False, dom_xss=False):  # <-- NEW: dom_xss
     log(f"--- Scanning: {url} (method={method}) ---")
 
     parsed = urlparse(url)
@@ -1903,10 +1903,17 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
         except Exception as e:
             log(f"[ERROR] bad --json for {url}: {e}")
 
-    base_status, base_text_raw, base_headers = baseline_response(method, url, headers=headers, json_body=json_body, data=post_data)
+    base_status, base_text_raw, base_headers = baseline_response(
+        method,
+        url,
+        headers=headers,
+        json_body=json_body,
+        data=post_data
+    )
     if base_status is None:
         log(f"[ERROR] Baseline request failed: {url}")
         return []
+
     base_text = normalize_response(base_text_raw)  # (4) استخدم المنقّى كأساس
 
     # Phase 4: fingerprint & tuned payloads
@@ -1940,11 +1947,42 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     # Findings list
     findings_total = []
 
+    # --- NEW: Phase 10: DOM-based XSS Static Detection ---
+    try:
+        if dom_xss and base_text_raw and base_headers:
+            ctype = base_headers.get("Content-Type", "")
+            if "text/html" in ctype.lower():
+                dom_findings = run_dom_xss_phase(
+                    url=url,
+                    html=base_text_raw,
+                    fingerprint=fingerprint,
+                    verbose=verbose
+                )
+                if dom_findings:
+                    for f in dom_findings:
+                        log(
+                            f"[DOM-XSS] {url} pattern={f.get('pattern')} "
+                            f"context={f.get('context')} (score={f.get('score')})"
+                        )
+                    findings_total.extend(dom_findings)
+    except Exception as e:
+        if verbose:
+            log(f"[DEBUG] DOM XSS phase error on {url}: {e}")
+
     # --- Phase 1: Blind Boolean-based SQLi (per-parameter, GET query only) ---
     try:
         if method.upper() == "GET" and params:
-            blind_phase = BlindBooleanSQLiPhase(retries=3, length_diff_ratio=0.15, similarity_threshold=0.97)
-            blind_findings = blind_phase.run_for_url(method, url, headers=headers, fingerprint=fingerprint)
+            blind_phase = BlindBooleanSQLiPhase(
+                retries=3,
+                length_diff_ratio=0.15,
+                similarity_threshold=0.97
+            )
+            blind_findings = blind_phase.run_for_url(
+                method,
+                url,
+                headers=headers,
+                fingerprint=fingerprint
+            )
             if blind_findings:
                 findings_total.extend(blind_findings)
     except Exception as e:
@@ -2023,6 +2061,11 @@ def scan_target(url, method="GET", postdata_str=None, headers=None, json_str=Non
     header_variants = [headers] if headers is not None else [None]
     if headers_inject:
         header_variants = generate_header_variants(headers, payloads)
+
+    # (هنا كَمِّل نفس منطقك القديم: لف على header_variants + params + payloads
+    # واستدعي _single_injection_attempt أو أي لوجيك عندك، وفي النهاية:)
+    #
+    # return findings_total
 
     # Build tasks (each task = one payload injection attempt)
     def add_param_payload_tasks(hdr, p_name, orig_params, jb=None, jkey=None):
@@ -2427,7 +2470,9 @@ def main():
                     union_extract=args.union_extract,
                     xss_context=args.xss_context,
                     active_fp=args.active_fp,
-                    xss_advanced=args.xss_advanced
+                    xss_advanced=args.xss_advanced,
+                    dom_xss=args.dom_xss
+
                 ))
             for f in as_completed(futs):
                 try:
