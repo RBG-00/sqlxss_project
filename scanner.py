@@ -1942,25 +1942,43 @@ def discover_endpoints_from_js(base_url, soup, headers=None):
             seen.add(u)
     return uniq
 
+import random
+
+def add_dummy_param(url):
+    parsed = urlparse(url)
+    q = parse_qs(parsed.query)
+
+    # لا تضف مرة أخرى لو موجود
+    for k in q.keys():
+        if k.startswith("_scnp_"):
+            return url
+
+    # باراميتر صغير (رقمين)
+    rnd = random.randint(10, 99)
+    dummy_key = f"_scnp_{rnd}"
+    dummy_val = "1"
+
+    q[dummy_key] = [dummy_val]
+
+    new_q = urlencode({k: v[0] for k, v in q.items()}, doseq=False)
+    return urlunparse(parsed._replace(query=new_q))
+
+
+
+
 def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
-    """
-    BFS crawling محسّن:
-    - يبدأ من base_url
-    - يجمع روابط نفس الدومين فقط
-    - يدعم <a href> + forms (GET)
-    - يحاول استخراج REST endpoints من ملفات JS (Juice Shop, SPA)
-    يرجّع list URLs
-    """
     visited = set()
     discovered = []
 
     queue = deque()
-    queue.append((base_url, 0))
+    queue.append((add_dummy_param(base_url), 0))
 
     log(f"[*] Crawling start: {base_url} (depth={max_depth}, max_pages={max_pages})")
 
     while queue and len(discovered) < max_pages:
         url, depth = queue.popleft()
+
+        url = add_dummy_param(url)
 
         if url in visited:
             continue
@@ -1975,12 +1993,10 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
             continue
 
         content_type = resp.headers.get("Content-Type", "")
-        if "text/html" not in content_type.lower():
-            # مش صفحة HTML → نعتبرها صفحة مكتشفة لكن ما نكمّل منها
-            discovered.append(url)
-            continue
-
         discovered.append(url)
+
+        if "text/html" not in content_type.lower():
+            continue
 
         if len(discovered) >= max_pages:
             break
@@ -1990,18 +2006,16 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
         except Exception:
             continue
 
-        # 1) روابط <a>
+        # الروابط
         for a in soup.find_all("a", href=True):
             href = a.get("href")
             if not href:
                 continue
-            full_url = urljoin(url, href)
-            if not is_same_domain(base_url, full_url):
-                continue
-            if full_url not in visited:
+            full_url = add_dummy_param(urljoin(url, href))
+            if is_same_domain(base_url, full_url) and full_url not in visited:
                 queue.append((full_url, depth + 1))
 
-        # 2) forms (GET) – نبني URLs مع كويري بارامز بسيطة
+        # الفورمز GET
         for form in soup.find_all("form"):
             action = form.get("action") or url
             method = (form.get("method") or "GET").upper()
@@ -2011,25 +2025,31 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
             for inp in form.find_all("input"):
                 name = inp.get("name")
                 if name:
-                    params[name] = "1"  # قيمة افتراضية
+                    params[name] = "1"
 
-            if method == "GET" and params:
-                q = urlencode(params)
-                if "?" in form_url:
-                    full_url = form_url + "&" + q
+            if method == "GET":
+                if params:
+                    q = urlencode(params)
+                    if "?" in form_url:
+                        full_url = form_url + "&" + q
+                    else:
+                        full_url = form_url + "?" + q
                 else:
-                    full_url = form_url + "?" + q
+                    full_url = form_url
+
+                full_url = add_dummy_param(full_url)
 
                 if is_same_domain(base_url, full_url) and full_url not in visited:
                     queue.append((full_url, depth + 1))
 
-        # 3) اكتشاف REST endpoints من ملفات JS (للـ SPA مثل Juice Shop)
-        js_endpoints = discover_endpoints_from_js(base_url, soup, headers=headers)
-        for full_url in js_endpoints:
-            if is_same_domain(base_url, full_url) and full_url not in visited:
-                queue.append((full_url, depth + 1))
+        # REST endpoints من ملفات JS
+        js_eps = discover_endpoints_from_js(base_url, soup, headers=headers)
+        for ep in js_eps:
+            ep = add_dummy_param(ep)
+            if is_same_domain(base_url, ep) and ep not in visited:
+                queue.append((ep, depth + 1))
 
-    # إزالة أي تكرارات مع الحفاظ على الترتيب
+    # إزالة التكرار
     unique = []
     seen = set()
     for u in discovered:
@@ -2039,6 +2059,9 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
 
     log(f"[*] Crawling finished: discovered {len(unique)} URLs")
     return unique
+
+
+       
 
 def build_argparser():
     parser = argparse.ArgumentParser(description="MVP SQLi/XSS scanner - Phases 1–4 + UNION + Context-Aware XSS + Advanced Reflected XSS")
