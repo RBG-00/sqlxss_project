@@ -2621,8 +2621,8 @@ def main():
                     break
                 except Exception as e:
                     log(f"[DEBUG] target error: {e}")
- except Exception as e:
-    log(f"[DEBUG] target error: {e}")
+                except Exception as e:
+                    log(f"[DEBUG] target error: {e}")
 
 for t in targets:
     try:
