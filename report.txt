@@ -1,18 +1,67 @@
---- Scanning: http://localhost:3000/rest/products/search?q=test (method=GET) ---
-[INFO] Fingerprint for http://localhost:3000/rest/products/search?q=test: {'server': None, 'language': 'php', 'database': None, 'evidence': ['language:php matched /\\bphp\\b/']}
-[TIME] Baseline avg for http://localhost:3000/rest/products/search?q=test: 0.038s (samples=3)
-[UNION] Trying UNION phase on http://localhost:3000/rest/products/search?q=test param q
-[UNION] ORDER BY 1 failed for http://localhost:3000/rest/products/search?q=test%27+ORDER+BY+1--+-
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: ' -- response length changed by 93.6% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: " -- response length changed by 1363.5% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: ' OR '1'='1 -- response length changed by 2401.7% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: " OR "1"="1 -- response length changed by 93.6% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload:  OR 1=1-- -- response length changed by 93.6% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: <script>alert(1)</script> -- response length changed by 93.6% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: "><script>alert(1)</script> -- response length changed by 93.6% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: <img src=x onerror=alert(1)> -- response length changed by 93.6% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: ";alert(1);// -- response length changed by 93.6% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: </script><script>alert(1)</script> -- response length changed by 93.6% (score=15)
-[VULN] Possible Injection on http://localhost:3000/rest/products/search?q=test param/key 'q' payload: " autofocus onfocus=alert(1) x=" -- response length changed by 93.6% (score=15)
-Scan finished in 1.31s. Findings: 11
-Structured JSON report saved to report.json
+[*] Crawling start: http://localhost:3000 (depth=2, max_pages=100)
+[*] Crawling finished: discovered 28 URLs
+--- Scanning: http://localhost:3000?_scnp_93=1 (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000?_scnp_93=1: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://localhost:3000?_scnp_93=1
+--- Scanning: http://localhost:3000/rest/repeat-notification?_scnp_43=1 (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000/rest/repeat-notification?_scnp_43=1: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://localhost:3000/rest/repeat-notification?_scnp_43=1
+--- Scanning: http://localhost:3000/rest/continue-code?_scnp_66=1 (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000/rest/continue-code?_scnp_66=1: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://localhost:3000/rest/continue-code?_scnp_66=1
+--- Scanning: http://localhost:3000/rest/continue-code-findIt?_scnp_28=1 (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000/rest/continue-code-findIt?_scnp_28=1: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://localhost:3000/rest/continue-code-findIt?_scnp_28=1
+--- Scanning: http://localhost:3000/rest/continue-code-fixIt?_scnp_15=1 (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000/rest/continue-code-fixIt?_scnp_15=1: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://localhost:3000/rest/continue-code-fixIt?_scnp_15=1
+--- Scanning: http://localhost:3000/rest/continue-code/apply/?_scnp_42=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/continue-code/apply/?_scnp_42=1
+--- Scanning: http://localhost:3000/rest/continue-code-findIt/apply/?_scnp_91=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/continue-code-findIt/apply/?_scnp_91=1
+--- Scanning: http://localhost:3000/rest/continue-code-fixIt/apply/?_scnp_49=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/continue-code-fixIt/apply/?_scnp_49=1
+--- Scanning: http://localhost:3000/rest/country-mapping?_scnp_34=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/country-mapping?_scnp_34=1
+--- Scanning: http://localhost:3000/rest/user/authentication-details/?_scnp_63=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/user/authentication-details/?_scnp_63=1
+--- Scanning: http://localhost:3000/rest/user/login?_scnp_82=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/user/login?_scnp_82=1
+--- Scanning: http://localhost:3000/rest/user/change-password?_scnp_90=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/user/change-password?_scnp_90=1
+--- Scanning: http://localhost:3000/rest/user/reset-password?_scnp_19=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/user/reset-password?_scnp_19=1
+--- Scanning: http://localhost:3000/rest/user/whoami?_scnp_75=1 (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000/rest/user/whoami?_scnp_75=1: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://localhost:3000/rest/user/whoami?_scnp_75=1
+--- Scanning: http://localhost:3000/rest/saveLoginIp?_scnp_28=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/saveLoginIp?_scnp_28=1
+--- Scanning: http://localhost:3000/rest/deluxe-membership?_scnp_66=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/deluxe-membership?_scnp_66=1
+--- Scanning: http://localhost:3000/rest/admin?_scnp_21=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/admin?_scnp_21=1
+--- Scanning: http://localhost:3000/rest/track-order?_scnp_23=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/track-order?_scnp_23=1
+--- Scanning: http://localhost:3000/rest/captcha?_scnp_13=1 (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000/rest/captcha?_scnp_13=1: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://localhost:3000/rest/captcha?_scnp_13=1
+--- Scanning: http://localhost:3000/rest/user/security-question?_scnp_34=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/user/security-question?_scnp_34=1
+--- Scanning: http://localhost:3000/rest/products?_scnp_19=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/products?_scnp_19=1
+--- Scanning: http://localhost:3000/rest/chatbot?_scnp_80=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/chatbot?_scnp_80=1
+--- Scanning: http://localhost:3000/rest/image-captcha/?_scnp_72=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/image-captcha/?_scnp_72=1
+--- Scanning: http://localhost:3000/rest/user?_scnp_84=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/user?_scnp_84=1
+--- Scanning: http://localhost:3000/rest/wallet/balance?_scnp_38=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/wallet/balance?_scnp_38=1
+--- Scanning: http://localhost:3000/rest/order-history?_scnp_45=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/order-history?_scnp_45=1
+--- Scanning: http://localhost:3000/rest/memories?_scnp_16=1 (method=GET) ---
+[INFO] Fingerprint for http://localhost:3000/rest/memories?_scnp_16=1: {'server': None, 'language': None, 'database': None, 'evidence': []}
+[OK] No issues detected (basic heuristics) for: http://localhost:3000/rest/memories?_scnp_16=1
+--- Scanning: http://localhost:3000/rest/web3?_scnp_14=1 (method=GET) ---
+[ERROR] Baseline request failed: http://localhost:3000/rest/web3?_scnp_14=1
+Scan finished in 7.63s. Findings: 0
