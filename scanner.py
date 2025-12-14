@@ -2624,36 +2624,36 @@ def main():
                 except Exception as e:
                     log(f"[DEBUG] target error: {e}")
 
-for t in targets:
-    try:
-        f = scan_target(
-            t,
-            method=args.method,
-            postdata_str=args.postdata,
-            headers=hdrs,
-            json_str=args.json,
-            headers_inject=args.headers_inject,
-            inject_all_params_flag=args.inject_all_params,
-            combined_payloads=combined_payloads,
-            verbose=args.verbose,
-            threads=args.threads,
-            payloads_categories=payloads_categories,
-            time_sqli=args.time_sqli,
-            time_delay=args.time_delay,
-            time_threshold=args.time_threshold,
-            time_samples=args.time_samples,
-            union_extract=args.union_extract,
-            xss_context=args.xss_context,
-            active_fp=args.active_fp,
-            xss_advanced=args.xss_advanced,
-            dom_xss=args.dom_xss,
-        )
-        all_findings.extend(f or [])
-    except KeyboardInterrupt:
-        print("Interrupted by user")
-        break
-    except Exception as e:
-        log(f"[DEBUG] target error: {e}")
+            for t in targets:
+                try:
+                    f = scan_target(
+                        t,
+                        method=args.method,
+                        postdata_str=args.postdata,
+                        headers=hdrs,
+                        json_str=args.json,
+                        headers_inject=args.headers_inject,
+                        inject_all_params_flag=args.inject_all_params,
+                        combined_payloads=combined_payloads,
+                        verbose=args.verbose,
+                        threads=args.threads,
+                        payloads_categories=payloads_categories,
+                        time_sqli=args.time_sqli,
+                        time_delay=args.time_delay,
+                        time_threshold=args.time_threshold,
+                        time_samples=args.time_samples,
+                        union_extract=args.union_extract,
+                        xss_context=args.xss_context,
+                        active_fp=args.active_fp,
+                        xss_advanced=args.xss_advanced,
+                        dom_xss=args.dom_xss,
+                    )
+                    all_findings.extend(f or [])
+                except KeyboardInterrupt:
+                    print("Interrupted by user")
+                    break
+                except Exception as e:
+                    log(f"[DEBUG] target error: {e}")
 
 
 
