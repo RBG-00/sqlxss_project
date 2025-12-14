@@ -2621,7 +2621,7 @@ def main():
                     break
                 except Exception as e:
                     log(f"[DEBUG] target error: {e}")
-   else:
+ else:
     for t in targets:
         try:
             f = scan_target(
@@ -2644,9 +2644,15 @@ def main():
                 xss_context=args.xss_context,
                 active_fp=args.active_fp,
                 xss_advanced=args.xss_advanced,
-                dom_xss=args.dom_xss   
+                dom_xss=args.dom_xss,
             )
             all_findings.extend(f or [])
+        except KeyboardInterrupt:
+            print("Interrupted by user")
+            break
+        except Exception as e:
+            log(f"[DEBUG] target error: {e}")
+
 
 
     elapsed = time.time() - start
