@@ -2623,7 +2623,7 @@ def main():
                     log(f"[DEBUG] target error: {e}")
                 except Exception as e:
                     log(f"[DEBUG] target error: {e}")
-
+    else:
             for t in targets:
                 try:
                     f = scan_target(
