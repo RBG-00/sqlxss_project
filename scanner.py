@@ -153,6 +153,41 @@ def compute_score(base_confidence=10, fingerprint=None, verify_result=None, payl
 
 
 # -------------------------
+# Phase 12: CSP helper (display/classification glue)
+# -------------------------
+def _phase12_enrich_xss_fields(resp_headers: dict):
+    """
+    Uses xss_part Phase 12 functions if available.
+    Returns (exploit_status, extra_dict) or (None, {}).
+    """
+    try:
+        if hasattr(xss_part, "analyze_csp") and hasattr(xss_part, "classify_xss_exploitability"):
+            csp_info = xss_part.analyze_csp(resp_headers or {})
+            exploit_status = xss_part.classify_xss_exploitability(csp_info)
+
+            xxp_info = None
+            if hasattr(xss_part, "analyze_x_xss_protection"):
+                xxp_info = xss_part.analyze_x_xss_protection(resp_headers or {})
+
+            extra = {
+                "csp_present": csp_info.get("present"),
+                "csp_level": csp_info.get("level"),
+                "csp_reason": csp_info.get("reason"),
+                # لا نخزن raw كامل دائمًا (ضجيج). إذا بدك raw احكيلي
+            }
+            if xxp_info:
+                extra.update({
+                    "x_xss_protection_present": xxp_info.get("present"),
+                    "x_xss_protection_value": xxp_info.get("value"),
+                    "x_xss_protection_status": xxp_info.get("status"),
+                })
+            return exploit_status, extra
+    except Exception:
+        pass
+    return None, {}
+
+
+# -------------------------
 # Phase 4: Fingerprinting & Payload tuning (kept in core)
 # -------------------------
 FINGERPRINT_RULES = {
@@ -391,14 +426,36 @@ def _is_sqli_finding(f: dict) -> bool:
     vt = (f.get("vuln_type") or "").lower()
     return ("sqli" in vt) or (vt == "sqli") or ("sql" in vt and "xss" not in vt)
 
+def _is_xss_finding(f: dict) -> bool:
+    if not isinstance(f, dict):
+        return False
+    vt = (f.get("vuln_type") or f.get("type") or "").lower()
+    return "xss" in vt
+
 def _default_recommendations_for_non_sqli(f: dict):
     vt = (f.get("vuln_type") or "").strip().lower()
-    if vt == "xss":
+    ex = (f.get("exploit_status") or "").strip().upper()
+
+    if "xss" in vt:
+        # Phase 12 awareness: توصيات حسب الاستغلال
+        if ex == "VULNERABLE_BUT_CSP_MITIGATES":
+            return [
+                "Fix root cause: context-aware output encoding (do not rely on CSP alone)",
+                "Review CSP for bypass risk (avoid unsafe-inline/unsafe-eval, prefer nonces/hashes)",
+                "Sanitize/validate user input where applicable",
+            ]
+        if ex == "VULNERABLE_AND_EXPLOITABLE":
+            return [
+                "Immediate fix: context-aware output encoding + strict input validation",
+                "Harden CSP (avoid unsafe-inline/unsafe-eval, use nonces/hashes)",
+                "Review sinks (innerHTML, document.write, template injection) and remove dangerous patterns",
+            ]
         return [
             "Output encoding (context-aware)",
             "Sanitize/validate user input",
-            "Enable CSP (Content-Security-Policy)",
+            "Enable/strengthen CSP (Content-Security-Policy)",
         ]
+
     if vt.startswith("possible"):
         return [
             "Re-test with --auto-verify",
@@ -660,7 +717,14 @@ def generate_full_html_report(findings, output_file="full_report.html"):
     def row(f):
         url = esc(f.get("url"))
         key = esc(f.get("injected_param"))
-        vt  = esc(f.get("report_type") or f.get("vuln_type") or "Unknown")
+        vt_raw = f.get("report_type") or f.get("vuln_type") or "Unknown"
+
+        # ✅ Phase 12: show exploit status for XSS in report
+        if _is_xss_finding(f) and f.get("exploit_status"):
+            vt = esc(f"{vt_raw} ({f.get('exploit_status')})")
+        else:
+            vt = esc(vt_raw)
+
         sev = f.get("severity") or "-"
         payload = esc(f.get("payload") or "")
         evidence = esc(f.get("evidence") or f.get("reason") or "")
@@ -689,7 +753,7 @@ def generate_full_html_report(findings, output_file="full_report.html"):
 
     # Buckets
     sqli = [f for f in items if _is_sqli_finding(f)]
-    xss  = [f for f in items if (f.get("vuln_type") or "").strip().upper() == "XSS"]
+    xss  = [f for f in items if _is_xss_finding(f)]
     heur = [f for f in items if (f.get("vuln_type") or "").strip().lower().startswith("possible")]
 
     html_doc = f"""<!doctype html>
@@ -750,7 +814,7 @@ def generate_full_html_report(findings, output_file="full_report.html"):
   </div>
 
   <div class="card" id="xss">
-    <h2>XSS Findings</h2>
+    <h2>XSS Findings (Phase 12 status included when available)</h2>
     <div style="overflow:auto; max-height:60vh;">
       <table>
         <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
@@ -772,7 +836,7 @@ def generate_full_html_report(findings, output_file="full_report.html"):
   <div class="card">
     <div class="meta" style="color:#6b7280">
       Note: SQLi classification/severity/recommendations are generated by Phase 7 in <span class="mono">sqli_part.py</span> only.
-      For XSS/Heuristics, recommendations are defaults for reporting convenience.
+      XSS entries may include Phase 12 exploitability status based on CSP/security headers.
     </div>
   </div>
 
@@ -838,6 +902,9 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
     reasons = []
     phase = None  # only set phase for SQLi error-based here
 
+    exploit_status = None
+    phase12_extra = {}
+
     if sqlerr:
         vuln_type = "SQLi"
         phase = "error"  # Phase7 hook for Error-based SQLi
@@ -847,6 +914,9 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
     if reflected and payload in xss_part.XSS_PAYLOADS:
         vuln_type = "XSS"
         reasons.append("payload reflected")
+
+        # ✅ Phase 12: CSP & security headers awareness (classification + extra)
+        exploit_status, phase12_extra = _phase12_enrich_xss_fields(getattr(r, "headers", {}) or {})
 
     if len_ratio > LENGTH_DIFF_THRESHOLD and status == base_status and not vuln_type:
         vuln_type = "Possible Injection"
@@ -868,7 +938,7 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
                 json_body=json_body,
                 json_key=json_key,
                 base_text=base_text,
-                detected_type=("SQLi" if vuln_type == "SQLi" else vuln_type),
+                detected_type=("SQLi" if vuln_type == "SQLi" else ("XSS" if vuln_type == "XSS" else vuln_type)),
                 fingerprint=fingerprint
             )
         except Exception:
@@ -899,9 +969,24 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
     if phase:
         finding["phase"] = phase
 
+    # ✅ Phase 12 fields for XSS
+    if vuln_type == "XSS":
+        if exploit_status:
+            finding["exploit_status"] = exploit_status
+        if phase12_extra:
+            finding.setdefault("extra", {})
+            finding["extra"].update(phase12_extra)
+
     msg = f"[VULN] {vuln_type} on {url} param/key '{finding['injected_param']}' payload: {payload} -- {finding['reason']} (score={score})"
     if finding["auto_verified"]:
         msg += " [AUTO-VERIFIED]"
+    if vuln_type == "XSS" and finding.get("exploit_status"):
+        msg += f" [STATUS: {finding.get('exploit_status')}]"
+        # لو بدك كمان CSP level في اللوج:
+        csp_lvl = (finding.get("extra") or {}).get("csp_level")
+        if csp_lvl:
+            msg += f" [CSP={csp_lvl}]"
+
     log(msg)
 
     return finding
@@ -933,6 +1018,9 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
         reflected_xss = any(pl in text for pl in xss_part.XSS_PAYLOADS)
         len_ratio = length_change_ratio(normalize_response(base_text), normalize_response(text))
 
+        exploit_status = None
+        phase12_extra = {}
+
         if sqlerr or reflected_xss or (len_ratio > LENGTH_DIFF_THRESHOLD and status == base_status):
             if sqlerr:
                 vuln_type = "SQLi"
@@ -940,6 +1028,7 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
             elif reflected_xss:
                 vuln_type = "XSS"
                 phase = None
+                exploit_status, phase12_extra = _phase12_enrich_xss_fields(getattr(r, "headers", {}) or {})
             else:
                 vuln_type = "Possible Multi-Param Injection"
                 phase = None
@@ -949,7 +1038,7 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
                 try:
                     verify_result = verify_vuln(
                         method, url, None, params, post_data, headers,
-                        base_text=base_text, detected_type=("SQLi" if vuln_type == "SQLi" else vuln_type), fingerprint=fingerprint
+                        base_text=base_text, detected_type=("SQLi" if vuln_type == "SQLi" else ("XSS" if vuln_type == "XSS" else vuln_type)), fingerprint=fingerprint
                     )
                 except Exception:
                     verify_result = {"verified": False, "evidence": "verify exception", "score_delta": 0, "elapsed": 0.0}
@@ -975,8 +1064,23 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
             if phase:
                 f["phase"] = phase
 
+            # ✅ Phase 12 fields for XSS
+            if vuln_type == "XSS":
+                if exploit_status:
+                    f["exploit_status"] = exploit_status
+                if phase12_extra:
+                    f.setdefault("extra", {})
+                    f["extra"].update(phase12_extra)
+
             findings.append(f)
-            log(f"[VULN] Multi-param {vuln_type} on {url} payload: {payload} -- len_change={len_ratio:.2f} (score={score})")
+
+            msg = f"[VULN] Multi-param {vuln_type} on {url} payload: {payload} -- len_change={len_ratio:.2f} (score={score})"
+            if vuln_type == "XSS" and f.get("exploit_status"):
+                msg += f" [STATUS: {f.get('exploit_status')}]"
+                csp_lvl = (f.get("extra") or {}).get("csp_level")
+                if csp_lvl:
+                    msg += f" [CSP={csp_lvl}]"
+            log(msg)
 
     return findings
 
@@ -1149,7 +1253,10 @@ def scan_target(
     xss_context=False,
     active_fp=False,
     xss_advanced=False,
-    dom_xss=False
+    dom_xss=False,
+    stored_xss=False,               # ✅ Phase 11 flag
+    stored_wait=2.0,               # ✅ Phase 11 wait
+    discovered_urls=None           # ✅ Phase 11 candidate views from crawl
 ):
     log(f"--- Scanning: {url} (method={method}) ---")
 
@@ -1219,6 +1326,51 @@ def scan_target(
         payloads = choose_payloads(fingerprint)
 
     findings_total = []
+
+    # ✅ Phase 11 Stored XSS (runs early, uses base HTML + candidate view pages)
+    try:
+        if stored_xss and base_text_raw and method.upper() == "GET":
+            # only meaningful for HTML pages with forms
+            ctype = (base_headers or {}).get("Content-Type", "")
+            is_html = ("text/html" in (ctype or "").lower()) or ("<html" in base_text_raw.lower())
+            if is_html:
+                if hasattr(xss_part, "run_stored_xss_phase") and hasattr(xss_part, "guess_view_pages"):
+                    # session shares cookies/headers for stored flows
+                    sess = requests.Session()
+                    if headers:
+                        sess.headers.update(headers)
+
+                    view_urls = xss_part.guess_view_pages(discovered_urls or [url], url)
+                    stored_findings = xss_part.run_stored_xss_phase(
+                        session=sess,
+                        input_page_url=url,
+                        input_html=base_text_raw,
+                        candidate_view_urls=view_urls,
+                        wait_sec=float(stored_wait or 2.0),
+                        log=log,
+                        verbose=verbose,
+                        now_ts=now_ts
+                    )
+                    if stored_findings:
+                        for sf in stored_findings:
+                            # normalize keys to match reporting style
+                            if isinstance(sf, dict):
+                                sf.setdefault("vuln_type", "Stored XSS")
+                                sf.setdefault("url", sf.get("input_url", url))
+                                sf.setdefault("test_url", sf.get("view_url", url))
+                                sf.setdefault("injected_param", ",".join(sf.get("input_fields", [])) or "[FORM]")
+                                sf.setdefault("payload", sf.get("payload", ""))
+                                sf.setdefault("status", "confirmed")
+                                sf.setdefault("score", 80)
+                                sf.setdefault("fingerprint", fingerprint or {})
+                                sf.setdefault("auto_verified", True)
+                                sf.setdefault("verify", {"verified": True, "evidence": sf.get("reason","stored marker found"), "score_delta": 50, "elapsed": 0.0})
+                        findings_total.extend(stored_findings)
+                else:
+                    log("[WARN] Stored XSS enabled but xss_part missing (run_stored_xss_phase/guess_view_pages). Skipping Phase 11.")
+    except Exception as e:
+        if verbose:
+            log(f"[DEBUG] Stored XSS phase error on {url}: {e}")
 
     # Phase 10 DOM XSS
     try:
@@ -1511,6 +1663,10 @@ def build_argparser():
     parser.add_argument("--xss-advanced", action="store_true")
     parser.add_argument("--dom-xss", action="store_true")
 
+    # ✅ Phase 11 Stored XSS
+    parser.add_argument("--stored-xss", action="store_true", help="Enable Stored XSS Engine (Phase 11)")
+    parser.add_argument("--stored-wait", type=float, default=2.0, help="Wait seconds after submitting stored payloads (default: 2.0)")
+
     return parser
 
 
@@ -1609,7 +1765,12 @@ def main():
                 xss_context=args.xss_context,
                 active_fp=args.active_fp,
                 xss_advanced=args.xss_advanced,
-                dom_xss=args.dom_xss
+                dom_xss=args.dom_xss,
+
+                # ✅ Phase 11 Stored XSS
+                stored_xss=args.stored_xss,
+                stored_wait=args.stored_wait,
+                discovered_urls=targets  # use crawl list as view candidates
             )
             all_findings.extend(f or [])
         except KeyboardInterrupt:

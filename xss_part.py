@@ -58,6 +58,127 @@ XSS_KEY_PARTS = [
 HTML_ENCODE_MARKERS = ["&lt;", "&gt;", "&quot;", "&#", "&amp;"]
 
 # -------------------------
+# Phase 12: CSP & Security Headers Awareness
+# -------------------------
+def _split_csp_directives(csp: str) -> dict:
+    """
+    Returns dict like {"default-src": ["'self'"], "script-src": ["'self'", "'unsafe-inline'"], ...}
+    """
+    out = {}
+    if not csp:
+        return out
+    parts = [p.strip() for p in csp.split(";") if p.strip()]
+    for p in parts:
+        tokens = p.split()
+        if not tokens:
+            continue
+        name = tokens[0].lower()
+        vals = [t.strip() for t in tokens[1:]]
+        out[name] = vals
+    return out
+
+def analyze_csp(headers: dict) -> dict:
+    """
+    Heuristic CSP assessment for typical reflected XSS payloads (inline/event handlers).
+    Returns:
+      {
+        "present": bool,
+        "level": "none" | "strong" | "weak",
+        "reason": str,
+        "raw": str
+      }
+    """
+    csp = headers.get("Content-Security-Policy") or headers.get("content-security-policy") or ""
+    csp = (csp or "").strip()
+    if not csp:
+        return {"present": False, "level": "none", "reason": "No CSP header", "raw": ""}
+
+    d = _split_csp_directives(csp)
+
+    # Effective script policy: script-src preferred, else default-src
+    script_policy = d.get("script-src") or d.get("default-src") or []
+    sp_join = " ".join(script_policy).lower()
+
+    has_nonce_or_hash = any(
+        v.startswith("'nonce-") or v.startswith("'sha256-") or v.startswith("'sha384-") or v.startswith("'sha512-")
+        for v in script_policy
+    )
+
+    allows_inline = "'unsafe-inline'" in sp_join
+    allows_eval = "'unsafe-eval'" in sp_join
+    allows_any = "*" in script_policy
+    allows_data_blob = any(v in ("data:", "blob:") for v in script_policy)
+
+    # Weak CSP signals (more likely exploitable)
+    if allows_inline or allows_eval or allows_any:
+        reasons = []
+        if allows_inline: reasons.append("unsafe-inline")
+        if allows_eval: reasons.append("unsafe-eval")
+        if allows_any: reasons.append("wildcard *")
+        if allows_data_blob: reasons.append("data:/blob:")
+        return {"present": True, "level": "weak", "reason": "CSP allows " + ", ".join(reasons), "raw": csp}
+
+    # If nonce/hash required and no unsafe-inline => strong against inline payloads
+    if has_nonce_or_hash and not allows_inline:
+        return {"present": True, "level": "strong", "reason": "Nonce/Hash required for scripts (inline blocked)", "raw": csp}
+
+    # Generally: no unsafe-inline => inline scripts blocked
+    if not allows_inline:
+        return {"present": True, "level": "strong", "reason": "No unsafe-inline (inline/event handlers likely blocked)", "raw": csp}
+
+    return {"present": True, "level": "strong", "reason": "CSP seems restrictive", "raw": csp}
+
+def analyze_x_xss_protection(headers: dict) -> dict:
+    """
+    Legacy header. Useful for reporting only (modern browsers mostly ignore it).
+    """
+    v = headers.get("X-XSS-Protection") or headers.get("x-xss-protection") or ""
+    v = (v or "").strip()
+    if not v:
+        return {"present": False, "value": "", "status": "missing"}
+    if v.startswith("0"):
+        return {"present": True, "value": v, "status": "disabled"}
+    if v.startswith("1"):
+        return {"present": True, "value": v, "status": "enabled"}
+    return {"present": True, "value": v, "status": "unknown"}
+
+def classify_xss_exploitability(csp_info: dict) -> str:
+    """
+    Returns:
+      - VULNERABLE_BUT_CSP_MITIGATES
+      - VULNERABLE_AND_EXPLOITABLE
+    """
+    if not csp_info or csp_info.get("level") == "strong":
+        return "VULNERABLE_BUT_CSP_MITIGATES"
+    return "VULNERABLE_AND_EXPLOITABLE"
+
+def enrich_finding_with_headers(finding: dict, resp) -> dict:
+    """
+    Attach CSP + X-XSS-Protection analysis to finding.
+    """
+    if not finding or not resp:
+        return finding
+
+    csp_info = analyze_csp(getattr(resp, "headers", {}) or {})
+    xxp_info = analyze_x_xss_protection(getattr(resp, "headers", {}) or {})
+
+    exploit_status = classify_xss_exploitability(csp_info)
+
+    extra = finding.get("extra") or {}
+    extra["csp_present"] = csp_info.get("present")
+    extra["csp_level"] = csp_info.get("level")
+    extra["csp_reason"] = csp_info.get("reason")
+    extra["csp_raw"] = csp_info.get("raw")
+    extra["x_xss_protection_present"] = xxp_info.get("present")
+    extra["x_xss_protection_value"] = xxp_info.get("value")
+    extra["x_xss_protection_status"] = xxp_info.get("status")
+    finding["extra"] = extra
+
+    finding["exploit_status"] = exploit_status
+    return finding
+
+
+# -------------------------
 # Auto-verify XSS
 # -------------------------
 def auto_verify_xss(method, url, param_name, original_params, post_data, headers,
@@ -165,9 +286,18 @@ def run_context_aware_xss_phase(method, url, params, headers, json_body, post_da
                 fingerprint=fingerprint
             )
             if f:
+                # keep context info
                 extra = f.get("extra") or {}
                 extra["xss_context"] = ctx
                 f["extra"] = extra
+
+                # Phase 12 enrichment (best effort: use response headers by re-fetching test_url if present)
+                test_url = f.get("test_url")
+                if test_url:
+                    rr = request_with_timeout("GET", test_url, headers=headers)
+                    if rr:
+                        f = enrich_finding_with_headers(f, rr)
+
                 findings.append(f)
 
     return findings
@@ -339,8 +469,14 @@ def run_advanced_reflected_xss_phase(method, url, params, headers, base_text_raw
                 }
             }
 
+            # ✅ Phase 12: attach CSP / X-XSS-Protection / exploitability
+            finding = enrich_finding_with_headers(finding, resp)
+
             if verbose:
-                log(f"[XSS-REFLECTED][{severity.upper()}] {url} param={param_name} ctx={ctx} payload={payload}")
+                # لو CSP قوي: خليها تطلع واضحة باللوج
+                es = finding.get("exploit_status")
+                csp_lvl = (finding.get("extra") or {}).get("csp_level")
+                log(f"[XSS-REFLECTED][{severity.upper()}][{es}][CSP={csp_lvl}] {url} param={param_name} ctx={ctx} payload={payload}")
 
             findings.append(finding)
             break
@@ -523,14 +659,13 @@ def _mk_uid():
     return uuid.uuid4().hex[:10]
 
 def make_unique_stored_payload(uid: str) -> str:
-    # Payload يعمل marker واضح ونقدر نلقطه في صفحة العرض
-    # (حتى لو ما نفّذ JS فعلياً، وجود الـ UID بالـ HTML دليل تخزين/عرض)
     return f'"><svg/onload=document.body.setAttribute("data-stored-xss","{uid}")><!--{uid}-->'
 
 def marker_present(html_text: str, uid: str) -> bool:
-    if not html_text:
+    if not html_text or not uid:
         return False
-    return (f'data-stored-xss","{uid}"' in html_text) or (f'<!--{uid}-->' in html_text) or (uid in html_text)
+    # ✅ نركز على comment marker لأنه الأكثر ثباتاً
+    return (f"<!--{uid}-->" in html_text) or (uid in html_text)
 
 def extract_forms(html_text: str):
     try:
@@ -557,7 +692,7 @@ def build_form_submission(form, base_url: str):
     return target, method, fields
 
 def guess_view_pages(discovered_urls: list, input_url: str):
-    keywords = ["comment", "comments", "review", "reviews", "post", "posts", "profile", "user", "admin", "feedback"]
+    keywords = ["comment", "comments", "review", "reviews", "post", "posts", "profile", "user", "admin", "feedback", "view"]
     base = urlparse(input_url).netloc
     views = []
     for u in (discovered_urls or []):
@@ -573,19 +708,55 @@ def guess_view_pages(discovered_urls: list, input_url: str):
         views.insert(0, input_url)
     return views[:30]
 
+def _fallback_view_urls(input_page_url: str):
+    common = ["/view", "/comments", "/comment", "/reviews", "/review", "/posts", "/post", "/feedback"]
+    out = []
+    if input_page_url:
+        out.append(input_page_url)
+        for p in common:
+            out.append(urljoin(input_page_url, p))
+
+    seen = set()
+    uniq = []
+    for u in out:
+        if u not in seen:
+            uniq.append(u); seen.add(u)
+    return uniq
+
+def _merge_view_urls(candidate_view_urls: list, input_page_url: str):
+    # ✅ حتى لو candidate موجودة: ضيف fallback دائمًا
+    merged = []
+    for u in (candidate_view_urls or []):
+        if u:
+            merged.append(u)
+    merged.extend(_fallback_view_urls(input_page_url))
+
+    seen = set()
+    uniq = []
+    for u in merged:
+        if u not in seen:
+            uniq.append(u); seen.add(u)
+    return uniq[:40]
+
 def run_stored_xss_phase(session, input_page_url: str, input_html: str,
                          candidate_view_urls: list, wait_sec: float = 2.0,
                          log=print, verbose: bool = False, now_ts=None):
     """
-    Returns list of findings:
-    - input_url, input_action, input_method, input_fields
-    - view_url
-    - payload + uid
+    Stored XSS engine:
+    - يحقن في كل form
+    - ينتظر
+    - يزور صفحات عرض (candidate + fallback)
+    - يسجّل: input_url + view_url + payload
+    - ✅ Phase 12: CSP awareness on the view page
     """
     findings = []
     forms = extract_forms(input_html)
     if not forms:
         return findings
+
+    views = _merge_view_urls(candidate_view_urls, input_page_url)
+    if verbose:
+        log(f"[STORED-XSS] Testing view pages ({len(views)}): {views}")
 
     for idx, form in enumerate(forms, start=1):
         target, method, fields = build_form_submission(form, input_page_url)
@@ -608,7 +779,6 @@ def run_stored_xss_phase(session, input_page_url: str, input_html: str,
                 val = el.get("value")
                 data[name] = val if val is not None else "1"
 
-        # Submit
         try:
             if method == "POST":
                 session.post(target, data=data, timeout=10, allow_redirects=True)
@@ -622,7 +792,7 @@ def run_stored_xss_phase(session, input_page_url: str, input_html: str,
 
         time.sleep(wait_sec)
 
-        for view_url in (candidate_view_urls or []):
+        for view_url in views:
             try:
                 r = session.get(view_url, timeout=10, allow_redirects=True)
             except Exception:
@@ -631,6 +801,11 @@ def run_stored_xss_phase(session, input_page_url: str, input_html: str,
                 continue
 
             if marker_present(r.text, uid):
+                # ✅ Phase 12: CSP on the VIEW page matters for stored XSS execution
+                csp_info = analyze_csp(getattr(r, "headers", {}) or {})
+                xxp_info = analyze_x_xss_protection(getattr(r, "headers", {}) or {})
+                exploit_status = classify_xss_exploitability(csp_info)
+
                 findings.append({
                     "timestamp": now_ts() if now_ts else "",
                     "type": "Stored XSS",
@@ -642,10 +817,20 @@ def run_stored_xss_phase(session, input_page_url: str, input_html: str,
                     "uid": uid,
                     "view_url": view_url,
                     "status_code": getattr(r, "status_code", None),
-                    "reason": f"Stored marker uid={uid} appeared in view page"
+                    "reason": f"Stored marker uid={uid} appeared in view page",
+                    "exploit_status": exploit_status,
+                    "extra": {
+                        "csp_present": csp_info.get("present"),
+                        "csp_level": csp_info.get("level"),
+                        "csp_reason": csp_info.get("reason"),
+                        "csp_raw": csp_info.get("raw"),
+                        "x_xss_protection_present": xxp_info.get("present"),
+                        "x_xss_protection_value": xxp_info.get("value"),
+                        "x_xss_protection_status": xxp_info.get("status"),
+                    }
                 })
                 if verbose:
-                    log(f"[STORED-XSS][HIT] input={input_page_url} -> view={view_url} uid={uid}")
+                    log(f"[STORED-XSS][HIT][{exploit_status}] input={input_page_url} -> view={view_url} uid={uid}")
                 break
 
     return findings
