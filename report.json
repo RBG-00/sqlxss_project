@@ -1,52 +1,176 @@
 {
-  "generated_at": "2025-12-16T19:41:58.401100+00:00",
-  "targets_scanned": 28,
-  "findings_count": 1,
+  "generated_at": "2025-12-29T14:57:16.682290+00:00",
+  "targets_scanned": 3,
+  "elapsed_sec": 38.824,
+  "findings_count": 3,
+  "summary": {
+    "total": 3,
+    "verified": 3,
+    "by_type": {
+      "Stored XSS": 3
+    },
+    "by_severity": {
+      "High": 3
+    },
+    "by_phase": {
+      "stored": 3
+    }
+  },
+  "pages": {
+    "http://127.0.0.1:3000/profile?_scnp_72=1": {
+      "count": 1,
+      "verified_count": 1,
+      "types": [
+        "XSS"
+      ],
+      "max_severity": "High",
+      "has_sqli": false,
+      "has_xss": true
+    },
+    "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_98=1": {
+      "count": 1,
+      "verified_count": 1,
+      "types": [
+        "XSS"
+      ],
+      "max_severity": "High",
+      "has_sqli": false,
+      "has_xss": true
+    },
+    "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_54=1": {
+      "count": 1,
+      "verified_count": 1,
+      "types": [
+        "XSS"
+      ],
+      "max_severity": "High",
+      "has_sqli": false,
+      "has_xss": true
+    }
+  },
   "findings": [
     {
-      "timestamp": "2025-12-16T19:41:52.129080+00:00",
-      "url": "http://localhost:3000?_scnp_15=1",
-      "test_url": "http://localhost:3000?_scnp_15=1%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
-      "method": "GET",
-      "injected_param": "_scnp_15",
-      "payload": "<script>alert(1)</script>",
-      "vuln_type": "Reflected XSS",
-      "reason": "Reflected XSS payload at line 11, column 17 in HTML Attribute",
-      "status_code": 200,
+      "timestamp": "2025-12-29T14:56:39.954235+00:00",
+      "input_url": "http://127.0.0.1:3000/profile?_scnp_72=1",
+      "view_url": "http://127.0.0.1:3000/profile?_scnp_72=1",
+      "input_fields": [
+        "bio"
+      ],
+      "payload": "STORED_XSS_d5c62c1db3",
+      "vuln_type": "XSS",
+      "report_type": "Stored XSS",
+      "xss_subtype": "stored",
+      "category": "XSS",
+      "phase": "stored",
+      "reason": "Stored marker found on view page: http://127.0.0.1:3000/profile?_scnp_72=1",
       "auto_verified": true,
       "verify": {
         "verified": true,
-        "evidence": "Reflected XSS payload at line 11, column 17 in HTML Attribute",
-        "score_delta": 35,
+        "evidence": "stored marker found",
+        "score_delta": 50,
         "elapsed": 0.0
       },
+      "score": 80,
+      "status": "confirmed",
+      "extra": {
+        "stored_marker": "STORED_XSS_d5c62c1db3",
+        "submit_action": "http://127.0.0.1:3000/profile/bio",
+        "submit_method": "POST"
+      },
+      "url": "http://127.0.0.1:3000/profile?_scnp_72=1",
+      "test_url": "http://127.0.0.1:3000/profile?_scnp_72=1",
+      "injected_param": "bio",
       "fingerprint": {
         "server": null,
-        "language": null,
+        "language": "node",
         "database": null,
-        "evidence": []
+        "evidence": [
+          "language:node matched /x-powered-by:\\s*express/"
+        ]
       },
-      "score": 75,
+      "severity": "High"
+    },
+    {
+      "timestamp": "2025-12-29T14:56:46.667346+00:00",
+      "input_url": "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_98=1",
+      "view_url": "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_98=1",
+      "input_fields": [
+        "bio"
+      ],
+      "payload": "STORED_XSS_5c5933d1d9",
+      "vuln_type": "XSS",
+      "report_type": "Stored XSS",
+      "xss_subtype": "stored",
+      "category": "XSS",
+      "phase": "stored",
+      "reason": "Stored marker found on view page: http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_98=1",
+      "auto_verified": true,
+      "verify": {
+        "verified": true,
+        "evidence": "stored marker found",
+        "score_delta": 50,
+        "elapsed": 0.0
+      },
+      "score": 80,
       "status": "confirmed",
-      "base_len": 75055,
-      "resp_len": 75055,
       "extra": {
-        "xss_match_type": "partial",
-        "xss_layer": "raw",
-        "xss_context": "HTML Attribute",
-        "xss_line": 11,
-        "xss_column": 17,
-        "xss_html_encoded": false,
-        "xss_matched_string": "script",
-        "csp_present": false,
-        "csp_level": "none",
-        "csp_reason": "No CSP header",
-        "csp_raw": "",
-        "x_xss_protection_present": false,
-        "x_xss_protection_value": "",
-        "x_xss_protection_status": "missing"
+        "stored_marker": "STORED_XSS_5c5933d1d9",
+        "submit_action": "http://127.0.0.1:3000/profile/bio",
+        "submit_method": "POST"
       },
-      "exploit_status": "VULNERABLE_AND_EXPLOITABLE"
+      "url": "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_98=1",
+      "test_url": "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_98=1",
+      "injected_param": "bio",
+      "fingerprint": {
+        "server": null,
+        "language": "node",
+        "database": null,
+        "evidence": [
+          "language:node matched /x-powered-by:\\s*express/"
+        ]
+      },
+      "severity": "High"
+    },
+    {
+      "timestamp": "2025-12-29T14:57:02.790094+00:00",
+      "input_url": "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_54=1",
+      "view_url": "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_54=1",
+      "input_fields": [
+        "bio"
+      ],
+      "payload": "STORED_XSS_a71f030b23",
+      "vuln_type": "XSS",
+      "report_type": "Stored XSS",
+      "xss_subtype": "stored",
+      "category": "XSS",
+      "phase": "stored",
+      "reason": "Stored marker found on view page: http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_54=1",
+      "auto_verified": true,
+      "verify": {
+        "verified": true,
+        "evidence": "stored marker found",
+        "score_delta": 50,
+        "elapsed": 0.0
+      },
+      "score": 80,
+      "status": "confirmed",
+      "extra": {
+        "stored_marker": "STORED_XSS_a71f030b23",
+        "submit_action": "http://127.0.0.1:3000/profile/bio",
+        "submit_method": "POST"
+      },
+      "url": "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_54=1",
+      "test_url": "http://127.0.0.1:3000/profile?name=1&bio=1&avatar=1&theme=1&_scnp_54=1",
+      "injected_param": "bio",
+      "fingerprint": {
+        "server": null,
+        "language": "node",
+        "database": null,
+        "evidence": [
+          "language:node matched /x-powered-by:\\s*express/"
+        ]
+      },
+      "severity": "High"
     }
   ]
 }

@@ -18,10 +18,8 @@
  .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
  .btn{display:inline-block;padding:6px 10px;border-radius:10px;background:#111827;color:#fff;text-decoration:none;font-size:12px}
  .tabs a{margin-right:10px;text-decoration:none;color:#111827;font-weight:bold}
- .badge {
-   padding: 4px 10px; border-radius: 999px; font-size: 12px; display: inline-block;
-   border: 1px solid rgba(0,0,0,0.08);
- }
+ .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; display: inline-block; border: 1px solid rgba(0,0,0,0.08); }
+ .sev-crit { background: rgba(239, 68, 68, 0.20); color: #7f1d1d; }
  .sev-high { background: rgba(220, 38, 38, 0.12); color: #b91c1c; }
  .sev-med  { background: rgba(245, 158, 11, 0.16); color: #b45309; }
  .sev-low  { background: rgba(16, 185, 129, 0.16); color: #047857; }
@@ -33,20 +31,19 @@
 <body>
 <div class="wrap">
   <div class="card">
-    <h1>Full Report (SQLi + XSS + Heuristics)</h1>
+    <h1>Full Report (SQLi + XSS )</h1>
     <div class="meta">
-      Generated at: <span class="mono">2025-12-16T19:38:54.236751+00:00</span><br/>
-      Total findings: <b>4</b> | SQLi: <b>0</b> | XSS: <b>4</b> | Heuristics: <b>0</b>
+      Generated at: <span class="mono">2025-12-29T14:57:16.683343+00:00</span><br/>
+      Total findings: <b>3</b> | SQLi: <b>0</b> | XSS: <b>3</b>
     </div>
     <div class="tabs" style="margin-top:10px">
       <a href="#sqli">SQLi</a>
       <a href="#xss">XSS</a>
-      <a href="#heur">Heuristics</a>
     </div>
   </div>
 
   <div class="card" id="sqli">
-    <h2>SQLi Findings (Phase 7 classification)</h2>
+    <h2>SQLi Findings </h2>
     <div style="overflow:auto; max-height:60vh;">
       <table>
         <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
@@ -56,67 +53,48 @@
   </div>
 
   <div class="card" id="xss">
-    <h2>XSS Findings (Phase 12 status included when available)</h2>
+    <h2>XSS Findings </h2>
     <div style="overflow:auto; max-height:60vh;">
       <table>
         <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
         <tbody>
         <tr>
-          <td class="mono">http://localhost:3000?_scnp_17=1</td>
-          <td class="mono">[DOM_ANALYSIS]</td>
-          <td>DOM XSS (client-side)</td>
-          <td><span class="badge sev-na">-</span></td>
-          <td class="mono"><code>[DOM_ANALYSIS]</code></td>
-          <td>Potential DOM-based XSS: source(s) location\.hash flowing into sink(s) innerHTML, setTimeout\(, Function\( at line 2 in script external:://cdnjs.cloudflare.com/ajax/libs/jquery/2.2.4/jquery.min.js</td>
+          <td class="mono">http://127.0.0.1:3000/profile?_scnp_72=1</td>
+          <td class="mono">bio</td>
+          <td>Stored XSS</td>
+          <td><span class="badge sev-high">High</span></td>
+          <td class="mono"><code>STORED_XSS_d5c62c1db3</code></td>
+          <td>Stored marker found on view page: http://127.0.0.1:3000/profile?_scnp_72=1</td>
           <td><ul class="recs"><li>Output encoding (context-aware)</li><li>Sanitize/validate user input</li><li>Enable/strengthen CSP (Content-Security-Policy)</li></ul></td>
-          <td><a class="btn" href="http://localhost:3000?_scnp_17=1" target="_blank">Open</a></td>
+          <td><a class="btn" href="http://127.0.0.1:3000/profile?_scnp_72=1" target="_blank">Open</a></td>
         </tr>
         
         <tr>
-          <td class="mono">http://localhost:3000?_scnp_17=1</td>
-          <td class="mono">[DOM_ANALYSIS]</td>
-          <td>DOM XSS (client-side)</td>
-          <td><span class="badge sev-na">-</span></td>
-          <td class="mono"><code>[DOM_ANALYSIS]</code></td>
-          <td>Potential DOM-based XSS: source(s) location\.hash, location\.search, location\.href, localStorage flowing into sink(s) innerHTML, outerHTML, setTimeout\(, setInterval\(, Function\( at line 1 in script external::vendor.js</td>
+          <td class="mono">http://127.0.0.1:3000/profile?name=1&amp;bio=1&amp;avatar=1&amp;theme=1&amp;_scnp_98=1</td>
+          <td class="mono">bio</td>
+          <td>Stored XSS</td>
+          <td><span class="badge sev-high">High</span></td>
+          <td class="mono"><code>STORED_XSS_5c5933d1d9</code></td>
+          <td>Stored marker found on view page: http://127.0.0.1:3000/profile?name=1&amp;bio=1&amp;avatar=1&amp;theme=1&amp;_scnp_98=1</td>
           <td><ul class="recs"><li>Output encoding (context-aware)</li><li>Sanitize/validate user input</li><li>Enable/strengthen CSP (Content-Security-Policy)</li></ul></td>
-          <td><a class="btn" href="http://localhost:3000?_scnp_17=1" target="_blank">Open</a></td>
+          <td><a class="btn" href="http://127.0.0.1:3000/profile?name=1&amp;bio=1&amp;avatar=1&amp;theme=1&amp;_scnp_98=1" target="_blank">Open</a></td>
         </tr>
         
         <tr>
-          <td class="mono">http://localhost:3000?_scnp_17=1</td>
-          <td class="mono">[DOM_ANALYSIS]</td>
-          <td>DOM XSS (client-side)</td>
-          <td><span class="badge sev-na">-</span></td>
-          <td class="mono"><code>[DOM_ANALYSIS]</code></td>
-          <td>Potential DOM-based XSS: source(s) location\.href, localStorage, sessionStorage flowing into sink(s) innerHTML, document\.write, setTimeout\( at line 1 in script external::main.js</td>
+          <td class="mono">http://127.0.0.1:3000/profile?name=1&amp;bio=1&amp;avatar=1&amp;theme=1&amp;_scnp_54=1</td>
+          <td class="mono">bio</td>
+          <td>Stored XSS</td>
+          <td><span class="badge sev-high">High</span></td>
+          <td class="mono"><code>STORED_XSS_a71f030b23</code></td>
+          <td>Stored marker found on view page: http://127.0.0.1:3000/profile?name=1&amp;bio=1&amp;avatar=1&amp;theme=1&amp;_scnp_54=1</td>
           <td><ul class="recs"><li>Output encoding (context-aware)</li><li>Sanitize/validate user input</li><li>Enable/strengthen CSP (Content-Security-Policy)</li></ul></td>
-          <td><a class="btn" href="http://localhost:3000?_scnp_17=1" target="_blank">Open</a></td>
-        </tr>
-        
-        <tr>
-          <td class="mono">http://localhost:3000?_scnp_17=1</td>
-          <td class="mono">_scnp_17</td>
-          <td>Reflected XSS (VULNERABLE_AND_EXPLOITABLE)</td>
-          <td><span class="badge sev-na">-</span></td>
-          <td class="mono"><code>&lt;script&gt;alert(1)&lt;/script&gt;</code></td>
-          <td>Reflected XSS payload at line 11, column 17 in HTML Attribute</td>
-          <td><ul class="recs"><li>Immediate fix: context-aware output encoding + strict input validation</li><li>Harden CSP (avoid unsafe-inline/unsafe-eval, use nonces/hashes)</li><li>Review sinks (innerHTML, document.write, template injection) and remove dangerous patterns</li></ul></td>
-          <td><a class="btn" href="http://localhost:3000?_scnp_17=1%3Cscript%3Ealert%281%29%3C%2Fscript%3E" target="_blank">Open</a></td>
+          <td><a class="btn" href="http://127.0.0.1:3000/profile?name=1&amp;bio=1&amp;avatar=1&amp;theme=1&amp;_scnp_54=1" target="_blank">Open</a></td>
         </tr>
         </tbody>
       </table>
     </div>
   </div>
 
-  <div class="card" id="heur">
-    <h2>Heuristics (Unclassified)</h2>
-    <div style="overflow:auto; max-height:60vh;">
-      <table>
-        <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
-        <tbody><tr><td colspan="8">No heuristic findings.</td></tr></tbody>
-      </table>
-    </div>
   </div>
 
   <div class="card">

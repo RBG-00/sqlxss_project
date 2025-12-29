@@ -8,7 +8,7 @@ import requests
 import re
 import time
 import json as _json
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin, unquote_plus
 from copy import deepcopy
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -79,31 +79,60 @@ def log(msg):
     except Exception:
         pass
 
-def request_with_timeout(method, url, params=None, data=None, headers=None, json_body=None):
+def request_with_timeout(method, url, params=None, data=None, headers=None, json_body=None, session=None):
+    """
+    Unified request helper. Uses provided session (requests.Session) when available.
+    """
     try:
         RATE_LIMITER.wait()
-        if method.upper() == "POST":
+        s = session or requests
+
+        method_u = (method or "GET").upper()
+        kwargs = {"headers": headers, "timeout": TIMEOUT, "allow_redirects": True}
+
+        if method_u == "POST":
+            if params:
+                kwargs["params"] = params
             if json_body is not None:
-                r = requests.post(
-                    url, params=params, json=json_body, headers=headers,
-                    timeout=TIMEOUT, allow_redirects=True
-                )
+                kwargs["json"] = json_body
             else:
-                r = requests.post(
-                    url, params=params, data=data, headers=headers,
-                    timeout=TIMEOUT, allow_redirects=True
-                )
-        else:
-            r = requests.get(
-                url, params=params, headers=headers,
-                timeout=TIMEOUT, allow_redirects=True
-            )
-        return r
+                kwargs["data"] = data
+            return s.post(url, **kwargs)
+
+        # GET
+        if params:
+            kwargs["params"] = params
+        return s.get(url, **kwargs)
+
     except Exception:
         return None
 
-def baseline_response(method, url, params=None, data=None, headers=None, json_body=None):
-    r = request_with_timeout(method, url, params=params, data=data, headers=headers, json_body=json_body)
+
+def response_meta(r):
+    if not r:
+        return {
+            "status": None, "final_url": None, "history": [],
+            "set_cookie": "", "cookies": {}, "len": 0
+        }
+    return {
+        "status": r.status_code,
+        "final_url": r.url,
+        "history": [(h.status_code, h.headers.get("Location", ""), h.url) for h in (r.history or [])],
+        "set_cookie": r.headers.get("Set-Cookie", "") or "",
+        "cookies": {c.name: c.value for c in r.cookies},
+        "len": len(r.text or ""),
+    }
+
+def request_with_meta(method, url, params=None, data=None, headers=None, json_body=None, session=None):
+    r = request_with_timeout(method, url, params=params, data=data, headers=headers, json_body=json_body, session=session)
+    return r, response_meta(r)
+
+
+def baseline_response(method, url, params=None, data=None, headers=None, json_body=None, session=None):
+    """
+    Baseline request must also use session (cookies/auth) if provided.
+    """
+    r = request_with_timeout(method, url, params=params, data=data, headers=headers, json_body=json_body, session=session)
     if not r:
         return None, None, None
     try:
@@ -153,13 +182,318 @@ def compute_score(base_confidence=10, fingerprint=None, verify_result=None, payl
 
 
 # -------------------------
+# ✅ Better Reflected-XSS detection (handles html-escape/url-decode)
+# -------------------------
+def is_reflected_payload(text: str, payload: str) -> bool:
+    if not text or not payload:
+        return False
+
+    candidates = {payload}
+    try:
+        candidates.add(unquote_plus(payload))
+    except Exception:
+        pass
+    try:
+        candidates.add(_html.unescape(payload))
+    except Exception:
+        pass
+
+    try:
+        text_unesc = _html.unescape(text)
+    except Exception:
+        text_unesc = text
+
+    for c in candidates:
+        if c and (c in text or c in text_unesc):
+            return True
+    return False
+
+
+# -------------------------
+# URL normalization + Dedup keys
+# -------------------------
+def _norm_url_for_key(u: str) -> str:
+    """
+    Normalize URL for dedup:
+      - remove fragment
+      - sort query params
+      - keep scheme+netloc+path+sorted query
+    """
+    try:
+        p = urlparse(u or "")
+        q = parse_qs(p.query, keep_blank_values=True)
+        # sort keys+values
+        items = []
+        for k in sorted(q.keys()):
+            vals = q.get(k) or [""]
+            for v in vals:
+                items.append((k, v))
+        query = urlencode(items, doseq=True)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, query, ""))  # drop fragment
+    except Exception:
+        return u or ""
+
+def _norm_payload(p: str) -> str:
+    if p is None:
+        return ""
+    # normalize whitespace only (keep content)
+    return re.sub(r"\s+", " ", str(p)).strip()
+
+def _finding_key(f: dict) -> tuple:
+    """
+    Strong dedup key:
+      - normalized base url
+      - method
+      - injected param
+      - payload (normalized)
+      - vuln_type
+      - phase
+    """
+    if not isinstance(f, dict):
+        return ("__invalid__",)
+    return (
+        _norm_url_for_key(f.get("url", "")),
+        (f.get("method") or "").upper(),
+        str(f.get("injected_param") or ""),
+        _norm_payload(f.get("payload") or ""),
+        (f.get("vuln_type") or "").lower(),
+        (f.get("phase") or "").lower(),
+    )
+
+def dedup_findings(findings: list):
+    """
+    Returns (unique_list, removed_count).
+    When duplicates exist, keep the "best" one:
+      - prefer verified
+      - then higher score
+    """
+    best = {}
+    removed = 0
+
+    def better(a, b):
+        # True if a is better than b
+        av = bool((a.get("verify") or {}).get("verified") or a.get("auto_verified"))
+        bv = bool((b.get("verify") or {}).get("verified") or b.get("auto_verified"))
+        if av != bv:
+            return av  # prefer verified
+        return (a.get("score") or 0) >= (b.get("score") or 0)
+
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        k = _finding_key(f)
+        if k not in best:
+            best[k] = f
+        else:
+            removed += 1
+            if better(f, best[k]):
+                best[k] = f
+
+    return list(best.values()), removed
+
+
+# -------------------------
+# XSS normalization (Reflected / Stored / DOM)
+# -------------------------
+def _infer_xss_subtype(f: dict) -> str:
+    """
+    Decide XSS subtype consistently.
+      - If finding already has xss_subtype, keep it.
+      - Else infer from phase/vuln_type/report_type.
+    """
+    if not isinstance(f, dict):
+        return ""
+
+    existing = (f.get("xss_subtype") or "").strip().lower()
+    if existing in ("reflected", "stored", "dom"):
+        return existing
+
+    phase = (f.get("phase") or "").strip().lower()
+    vt = (f.get("vuln_type") or "").strip().lower()
+    rt = (f.get("report_type") or "").strip().lower()
+
+    if phase == "stored" or "stored" in vt or "stored" in rt:
+        return "stored"
+    if phase == "dom" or "dom" in vt or "dom" in rt:
+        return "dom"
+    return "reflected"
+
+def normalize_xss_finding(f: dict) -> dict:
+    """
+    Ensures the report shows Stored/DOM explicitly (not only generic "XSS").
+    Adds:
+      - xss_subtype: reflected|stored|dom
+      - report_type: Reflected XSS|Stored XSS|DOM XSS
+      - category: XSS (for easy filtering)
+    """
+    if not isinstance(f, dict):
+        return f
+
+    vt = (f.get("vuln_type") or f.get("type") or "").strip().lower()
+    is_xss = ("xss" in vt) or ("xss" in (f.get("report_type") or "").lower())
+
+    if not is_xss:
+        return f
+
+    sub = _infer_xss_subtype(f)
+    f["category"] = "XSS"
+    f["xss_subtype"] = sub
+
+    if sub == "stored":
+        f["report_type"] = "Stored XSS"
+    elif sub == "dom":
+        f["report_type"] = "DOM XSS"
+    else:
+        f["report_type"] = "Reflected XSS"
+
+    if not f.get("vuln_type"):
+        f["vuln_type"] = "XSS"
+
+    return f
+
+def normalize_all_findings(findings: list):
+    out = []
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        out.append(normalize_xss_finding(f))
+    return out
+
+
+# -------------------------
+# Severity aggregation rules (scanner-level)
+# -------------------------
+_SEV_RANK = {"Info": 0, "Low": 1, "Medium": 2, "High": 3, "Critical": 4}
+
+def _sev_max(a: str, b: str) -> str:
+    a = a or "Info"
+    b = b or "Info"
+    return a if _SEV_RANK.get(a, 0) >= _SEV_RANK.get(b, 0) else b
+
+def _severity_for_finding_scanner(f: dict) -> str:
+    """
+    Ensure every finding has a severity, even if module didn't provide it.
+    """
+    if not isinstance(f, dict):
+        return "Info"
+
+    existing = f.get("severity")
+    if existing:
+        return existing
+
+    vt = (f.get("vuln_type") or "").lower()
+    ph = (f.get("phase") or "").lower()
+    verified = bool((f.get("verify") or {}).get("verified") or f.get("auto_verified"))
+
+    # SQLi
+    if "sqli" in vt or vt == "sqli" or (("sql" in vt) and ("xss" not in vt)):
+        if ph in ("union", "time"):
+            return "High" if verified else "Medium"
+        if ph in ("blind", "error"):
+            return "High" if verified else ("Medium" if ph == "blind" else "Low")
+        if ph in ("heuristic", "unknown"):
+            return "Low"
+        return "Medium" if verified else "Low"
+
+    # XSS
+    if "xss" in vt or (f.get("category") == "XSS"):
+        sub = (f.get("xss_subtype") or _infer_xss_subtype(f)).lower()
+        ex = (f.get("exploit_status") or "").upper()
+
+        if sub == "stored":
+            return "High"
+        if sub == "dom":
+            return "High" if verified else "Medium"
+
+        if verified:
+            return "High"
+        if ex == "VULNERABLE_AND_EXPLOITABLE":
+            return "High"
+        if ex == "VULNERABLE_BUT_CSP_MITIGATES":
+            return "Medium"
+        return "Medium"
+
+    return "Low"
+
+
+def aggregate_page_risk(findings: list):
+    pages = {}
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        u = f.get("url") or ""
+        if u not in pages:
+            pages[u] = {
+                "count": 0,
+                "verified_count": 0,
+                "types": set(),
+                "max_severity": "Info",
+                "has_sqli": False,
+                "has_xss": False,
+            }
+
+        sev = _severity_for_finding_scanner(f)
+        f["severity"] = sev
+
+        pages[u]["count"] += 1
+        if bool((f.get("verify") or {}).get("verified") or f.get("auto_verified")):
+            pages[u]["verified_count"] += 1
+
+        vt = (f.get("vuln_type") or "").lower()
+        if ("xss" in vt) or (f.get("category") == "XSS"):
+            pages[u]["has_xss"] = True
+            pages[u]["types"].add("XSS")
+        if ("sqli" in vt) or (vt == "sqli") or ("sql" in vt and "xss" not in vt):
+            pages[u]["has_sqli"] = True
+            pages[u]["types"].add("SQLi")
+
+        pages[u]["max_severity"] = _sev_max(pages[u]["max_severity"], sev)
+
+    for u, info in pages.items():
+        if info["has_sqli"] and info["has_xss"]:
+            if info["verified_count"] > 0:
+                info["max_severity"] = _sev_max(info["max_severity"], "Critical")
+            else:
+                info["max_severity"] = _sev_max(info["max_severity"], "High")
+
+    for u, info in pages.items():
+        info["types"] = sorted(list(info["types"]))
+
+    return pages
+
+
+def compute_summary(findings: list):
+    summary = {
+        "total": 0,
+        "verified": 0,
+        "by_type": {},
+        "by_severity": {},
+        "by_phase": {}
+    }
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        summary["total"] += 1
+        sev = f.get("severity") or _severity_for_finding_scanner(f)
+        summary["by_severity"][sev] = summary["by_severity"].get(sev, 0) + 1
+
+        verified = bool((f.get("verify") or {}).get("verified") or f.get("auto_verified"))
+        if verified:
+            summary["verified"] += 1
+
+        vt = f.get("report_type") or f.get("vuln_type") or "Unknown"
+        summary["by_type"][vt] = summary["by_type"].get(vt, 0) + 1
+
+        ph = (f.get("phase") or "none").lower()
+        summary["by_phase"][ph] = summary["by_phase"].get(ph, 0) + 1
+
+    return summary
+
+
+# -------------------------
 # Phase 12: CSP helper (display/classification glue)
 # -------------------------
 def _phase12_enrich_xss_fields(resp_headers: dict):
-    """
-    Uses xss_part Phase 12 functions if available.
-    Returns (exploit_status, extra_dict) or (None, {}).
-    """
     try:
         if hasattr(xss_part, "analyze_csp") and hasattr(xss_part, "classify_xss_exploitability"):
             csp_info = xss_part.analyze_csp(resp_headers or {})
@@ -173,7 +507,6 @@ def _phase12_enrich_xss_fields(resp_headers: dict):
                 "csp_present": csp_info.get("present"),
                 "csp_level": csp_info.get("level"),
                 "csp_reason": csp_info.get("reason"),
-                # لا نخزن raw كامل دائمًا (ضجيج). إذا بدك raw احكيلي
             }
             if xxp_info:
                 extra.update({
@@ -213,11 +546,6 @@ FINGERPRINT_RULES = {
 }
 
 def fingerprint_response(resp_text, resp_headers):
-    """
-    Fingerprinting يعتمد على:
-    - FINGERPRINT_RULES
-    - + DB_ERROR_SIGNATURES الموجودة داخل sqli_part (error-based)
-    """
     text = (resp_text or "").lower()
     headers_join = " ".join([f"{k}:{v}" for k, v in (resp_headers or {}).items()]).lower()
 
@@ -237,7 +565,6 @@ def fingerprint_response(resp_text, resp_headers):
             if found[category]:
                 break
 
-    # Use DB error signatures from sqli_part to refine DB
     db_scores = {}
     for dbms, patterns in sqli_part.DB_ERROR_SIGNATURES.items():
         for p in patterns:
@@ -262,7 +589,6 @@ def fingerprint_response(resp_text, resp_headers):
     return found
 
 
-# Payload sets (kept: DB-specific + default combined from both modules)
 PAYLOAD_SETS = {
     "default": sqli_part.SQL_PAYLOADS + xss_part.XSS_PAYLOADS,
 
@@ -349,27 +675,34 @@ def choose_payloads(fingerprint):
 # Auto-verification wrapper (delegates to modules)
 # -------------------------
 def verify_vuln(method, url, param_name, original_params, post_data, headers,
-                json_body=None, json_key=None, base_text="", detected_type=None, fingerprint=None):
+                json_body=None, json_key=None, base_text="", detected_type=None,
+                fingerprint=None, request_fn=None):
+
+    req = request_fn or request_with_timeout
 
     if detected_type == "SQLi":
-        ok = sqli_part.auto_verify_sqli(
+        ok_or_details = sqli_part.auto_verify_sqli(
             method=method,
             url=url,
             param_name=param_name,
             original_params=original_params,
             post_data=post_data,
             headers=headers,
-            request_with_timeout=request_with_timeout,
+            request_with_timeout=req,
             normalize_response=normalize_response,
             base_text=base_text,
             json_body=json_body,
-            json_key=json_key
+            json_key=json_key,
+            return_details=True
         )
+        ok = bool(ok_or_details.get("verified")) if isinstance(ok_or_details, dict) else bool(ok_or_details)
+        ev = ok_or_details.get("evidence") if isinstance(ok_or_details, dict) else ""
         return {
             "verified": bool(ok),
-            "evidence": "auto_verify_sqli " + ("succeeded" if ok else "failed"),
+            "evidence": ev or ("auto_verify_sqli " + ("succeeded" if ok else "failed")),
             "score_delta": 40 if ok else 0,
-            "elapsed": 0.0
+            "elapsed": 0.0,
+            "details": ok_or_details if isinstance(ok_or_details, dict) else {}
         }
 
     if detected_type == "XSS":
@@ -380,7 +713,7 @@ def verify_vuln(method, url, param_name, original_params, post_data, headers,
             original_params=original_params,
             post_data=post_data,
             headers=headers,
-            request_with_timeout=request_with_timeout,
+            request_with_timeout=req,
             json_body=json_body,
             json_key=json_key
         )
@@ -420,7 +753,6 @@ def generate_header_variants(base_headers, payloads):
 def _is_sqli_finding(f: dict) -> bool:
     if not isinstance(f, dict):
         return False
-    # Phase7 is single source of truth for SQLi classification. We only decide "SQLi-ish" for inclusion.
     if f.get("phase") in ("error", "blind", "time", "union"):
         return True
     vt = (f.get("vuln_type") or "").lower()
@@ -430,14 +762,16 @@ def _is_xss_finding(f: dict) -> bool:
     if not isinstance(f, dict):
         return False
     vt = (f.get("vuln_type") or f.get("type") or "").lower()
-    return "xss" in vt
+    rt = (f.get("report_type") or "").lower()
+    return ("xss" in vt) or ("xss" in rt) or (f.get("category") == "XSS")
 
 def _default_recommendations_for_non_sqli(f: dict):
     vt = (f.get("vuln_type") or "").strip().lower()
     ex = (f.get("exploit_status") or "").strip().upper()
+    rt = (f.get("report_type") or "").strip().lower()
+    is_xss = ("xss" in vt) or ("xss" in rt) or (f.get("category") == "XSS")
 
-    if "xss" in vt:
-        # Phase 12 awareness: توصيات حسب الاستغلال
+    if is_xss:
         if ex == "VULNERABLE_BUT_CSP_MITIGATES":
             return [
                 "Fix root cause: context-aware output encoding (do not rely on CSP alone)",
@@ -472,10 +806,8 @@ def _default_recommendations_for_non_sqli(f: dict):
 # Phase 7 SQLi-only HTML report
 # -------------------------
 def generate_sqli_html_report(findings, output_file="sqli_report.html"):
-    # only include SQLi findings
     sqli_findings = [f for f in (findings or []) if _is_sqli_finding(f)]
 
-    # enrich via Phase7 ONLY
     try:
         sqli_findings = sqli_part.enrich_sqli_findings_list(sqli_findings)
     except Exception as e:
@@ -484,17 +816,18 @@ def generate_sqli_html_report(findings, output_file="sqli_report.html"):
     def esc(x):
         return _html.escape(str(x)) if x is not None else ""
 
-    # small summary
     counts_by_type = {}
     counts_by_sev = {}
     for f in sqli_findings:
         rt = f.get("report_type") or "Unknown"
-        sv = f.get("severity") or "Low"
+        sv = f.get("severity") or _severity_for_finding_scanner(f)
         counts_by_type[rt] = counts_by_type.get(rt, 0) + 1
         counts_by_sev[sv] = counts_by_sev.get(sv, 0) + 1
 
     def badge_class(sev):
         s = (sev or "").lower()
+        if "critical" in s:
+            return "sev-crit"
         if "high" in s:
             return "sev-high"
         if "medium" in s:
@@ -531,90 +864,27 @@ def generate_sqli_html_report(findings, output_file="sqli_report.html"):
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Advanced SQLi Report</title>
   <style>
-    body {{
-      font-family: Arial, sans-serif;
-      background: #f6f7fb;
-      margin: 0;
-      color: #111;
-    }}
-    .wrap {{
-      max-width: 1200px;
-      margin: 24px auto;
-      padding: 0 16px;
-    }}
-    .card {{
-      background: #fff;
-      border: 1px solid #e7e7ef;
-      border-radius: 14px;
-      box-shadow: 0 8px 22px rgba(0,0,0,0.06);
-      padding: 16px;
-      margin-bottom: 16px;
-    }}
-    h1 {{
-      margin: 0 0 8px;
-      font-size: 22px;
-    }}
-    .meta {{
-      color: #444;
-      font-size: 13px;
-      line-height: 1.5;
-    }}
-    .grid {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-top: 12px;
-    }}
-    @media (max-width: 900px) {{
-      .grid {{ grid-template-columns: 1fr; }}
-    }}
-    ul {{
-      margin: 6px 0 0;
-      padding-left: 18px;
-    }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      overflow: hidden;
-      border-radius: 12px;
-    }}
-    th, td {{
-      border-bottom: 1px solid #ececf4;
-      padding: 10px;
-      vertical-align: top;
-      font-size: 13px;
-    }}
-    th {{
-      text-align: left;
-      background: #111827;
-      color: #fff;
-      position: sticky;
-      top: 0;
-      z-index: 1;
-    }}
-    tr:hover td {{
-      background: #fafaff;
-    }}
-    .mono {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size: 12px;
-    }}
-    .badge {{
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      display: inline-block;
-      border: 1px solid rgba(0,0,0,0.08);
-    }}
+    body {{ font-family: Arial, sans-serif; background: #f6f7fb; margin: 0; color: #111; }}
+    .wrap {{ max-width: 1200px; margin: 24px auto; padding: 0 16px; }}
+    .card {{ background: #fff; border: 1px solid #e7e7ef; border-radius: 14px; box-shadow: 0 8px 22px rgba(0,0,0,0.06); padding: 16px; margin-bottom: 16px; }}
+    h1 {{ margin: 0 0 8px; font-size: 22px; }}
+    .meta {{ color: #444; font-size: 13px; line-height: 1.5; }}
+    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+    ul {{ margin: 6px 0 0; padding-left: 18px; }}
+    table {{ width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 12px; }}
+    th, td {{ border-bottom: 1px solid #ececf4; padding: 10px; vertical-align: top; font-size: 13px; }}
+    th {{ text-align: left; background: #111827; color: #fff; position: sticky; top: 0; z-index: 1; }}
+    tr:hover td {{ background: #fafaff; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }}
+    .badge {{ padding: 4px 10px; border-radius: 999px; font-size: 12px; display: inline-block; border: 1px solid rgba(0,0,0,0.08); }}
+    .sev-crit {{ background: rgba(239, 68, 68, 0.20); color: #7f1d1d; }}
     .sev-high {{ background: rgba(220, 38, 38, 0.12); color: #b91c1c; }}
     .sev-med  {{ background: rgba(245, 158, 11, 0.16); color: #b45309; }}
     .sev-low  {{ background: rgba(16, 185, 129, 0.16); color: #047857; }}
     .recs li {{ margin-bottom: 4px; }}
     .muted {{ color: #6b7280; }}
-    .btn {{
-      display:inline-block; padding:6px 10px; border-radius:10px;
-      background:#111827; color:#fff; text-decoration:none; font-size:12px;
-    }}
+    .btn {{ display:inline-block; padding:6px 10px; border-radius:10px; background:#111827; color:#fff; text-decoration:none; font-size:12px; }}
   </style>
 </head>
 <body>
@@ -685,7 +955,11 @@ def generate_sqli_html_report(findings, output_file="sqli_report.html"):
 def generate_full_html_report(findings, output_file="full_report.html"):
     items = [f for f in (findings or []) if isinstance(f, dict)]
 
-    # Enrich SQLi only via Phase7
+    items = normalize_all_findings(items)
+    for f in items:
+        if "severity" not in f or not f.get("severity"):
+            f["severity"] = _severity_for_finding_scanner(f)
+
     try:
         sqli_only = [f for f in items if _is_sqli_finding(f)]
         enriched = sqli_part.enrich_sqli_findings_list(sqli_only)
@@ -698,6 +972,8 @@ def generate_full_html_report(findings, output_file="full_report.html"):
             k = _k(f)
             if k in em:
                 f.update(em[k])
+                if "severity" not in f or not f.get("severity"):
+                    f["severity"] = _severity_for_finding_scanner(f)
     except Exception as e:
         log(f"[DEBUG] full-report enrich failed: {e}")
 
@@ -706,6 +982,8 @@ def generate_full_html_report(findings, output_file="full_report.html"):
 
     def badge_class(sev):
         s = (sev or "").lower()
+        if "critical" in s:
+            return "sev-crit"
         if "high" in s:
             return "sev-high"
         if "medium" in s:
@@ -717,9 +995,8 @@ def generate_full_html_report(findings, output_file="full_report.html"):
     def row(f):
         url = esc(f.get("url"))
         key = esc(f.get("injected_param"))
-        vt_raw = f.get("report_type") or f.get("vuln_type") or "Unknown"
 
-        # ✅ Phase 12: show exploit status for XSS in report
+        vt_raw = f.get("report_type") or f.get("vuln_type") or "Unknown"
         if _is_xss_finding(f) and f.get("exploit_status"):
             vt = esc(f"{vt_raw} ({f.get('exploit_status')})")
         else:
@@ -751,10 +1028,8 @@ def generate_full_html_report(findings, output_file="full_report.html"):
         </tr>
         """
 
-    # Buckets
     sqli = [f for f in items if _is_sqli_finding(f)]
     xss  = [f for f in items if _is_xss_finding(f)]
-    heur = [f for f in items if (f.get("vuln_type") or "").strip().lower().startswith("possible")]
 
     html_doc = f"""<!doctype html>
 <html>
@@ -776,10 +1051,8 @@ def generate_full_html_report(findings, output_file="full_report.html"):
  .mono{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}}
  .btn{{display:inline-block;padding:6px 10px;border-radius:10px;background:#111827;color:#fff;text-decoration:none;font-size:12px}}
  .tabs a{{margin-right:10px;text-decoration:none;color:#111827;font-weight:bold}}
- .badge {{
-   padding: 4px 10px; border-radius: 999px; font-size: 12px; display: inline-block;
-   border: 1px solid rgba(0,0,0,0.08);
- }}
+ .badge {{ padding: 4px 10px; border-radius: 999px; font-size: 12px; display: inline-block; border: 1px solid rgba(0,0,0,0.08); }}
+ .sev-crit {{ background: rgba(239, 68, 68, 0.20); color: #7f1d1d; }}
  .sev-high {{ background: rgba(220, 38, 38, 0.12); color: #b91c1c; }}
  .sev-med  {{ background: rgba(245, 158, 11, 0.16); color: #b45309; }}
  .sev-low  {{ background: rgba(16, 185, 129, 0.16); color: #047857; }}
@@ -791,20 +1064,19 @@ def generate_full_html_report(findings, output_file="full_report.html"):
 <body>
 <div class="wrap">
   <div class="card">
-    <h1>Full Report (SQLi + XSS + Heuristics)</h1>
+    <h1>Full Report (SQLi + XSS )</h1>
     <div class="meta">
       Generated at: <span class="mono">{esc(now_ts())}</span><br/>
-      Total findings: <b>{len(items)}</b> | SQLi: <b>{len(sqli)}</b> | XSS: <b>{len(xss)}</b> | Heuristics: <b>{len(heur)}</b>
+      Total findings: <b>{len(items)}</b> | SQLi: <b>{len(sqli)}</b> | XSS: <b>{len(xss)}</b>
     </div>
     <div class="tabs" style="margin-top:10px">
       <a href="#sqli">SQLi</a>
       <a href="#xss">XSS</a>
-      <a href="#heur">Heuristics</a>
     </div>
   </div>
 
   <div class="card" id="sqli">
-    <h2>SQLi Findings (Phase 7 classification)</h2>
+    <h2>SQLi Findings </h2>
     <div style="overflow:auto; max-height:60vh;">
       <table>
         <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
@@ -814,7 +1086,7 @@ def generate_full_html_report(findings, output_file="full_report.html"):
   </div>
 
   <div class="card" id="xss">
-    <h2>XSS Findings (Phase 12 status included when available)</h2>
+    <h2>XSS Findings </h2>
     <div style="overflow:auto; max-height:60vh;">
       <table>
         <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
@@ -823,14 +1095,6 @@ def generate_full_html_report(findings, output_file="full_report.html"):
     </div>
   </div>
 
-  <div class="card" id="heur">
-    <h2>Heuristics (Unclassified)</h2>
-    <div style="overflow:auto; max-height:60vh;">
-      <table>
-        <thead><tr><th>URL</th><th>Param/Key</th><th>Type</th><th>Severity</th><th>Payload</th><th>Evidence</th><th>Recommendations</th><th>Open</th></tr></thead>
-        <tbody>{''.join(row(f) for f in heur) or '<tr><td colspan="8">No heuristic findings.</td></tr>'}</tbody>
-      </table>
-    </div>
   </div>
 
   <div class="card">
@@ -853,38 +1117,45 @@ def generate_full_html_report(findings, output_file="full_report.html"):
 
 
 # -------------------------
-# Core single attempt (kept in scanner.py because Phase8 calls it)
+# Core single attempt
 # -------------------------
 def _single_injection_attempt(method, url, param_name, original_params, base_text, base_status,
                               payload, post_data=None, headers=None, json_body=None, json_key=None,
-                              verbose=False, fingerprint=None):
+                              verbose=False, fingerprint=None, session=None, request_fn=None):
 
-    # Build request
+    req = request_fn or (lambda m, u, **kw: request_with_timeout(m, u, session=session, **kw))
+
     if json_body is not None and json_key is not None:
         jb = deepcopy(json_body)
         jb[json_key] = payload
-        r = request_with_timeout(method, url, headers=headers, json_body=jb)
+        r = req(method, url, headers=headers, json_body=jb)
         test_url = url
         injected_key = json_key
-    else:
-        params_copy = deepcopy(original_params) if original_params else {}
-        injected_key = param_name if param_name is not None else "_scantest"
-        params_copy[injected_key] = [payload]
-        parsed = urlparse(url)
-        query = urlencode({k: v[0] for k, v in params_copy.items()}, doseq=False)
-        new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
 
-        if method.upper() == "POST":
-            if post_data and injected_key in post_data:
-                pd = deepcopy(post_data); pd[injected_key] = payload
-                r = request_with_timeout("POST", url, data=pd, headers=headers)
-                test_url = url
-            else:
-                r = request_with_timeout("POST", new_url, data=post_data, headers=headers)
-                test_url = new_url
+    else:
+        injected_key = param_name if param_name is not None else "_scantest"
+
+        # POST form-data => ALWAYS inject into body
+        if method.upper() == "POST" and post_data is not None:
+            pd = deepcopy(post_data or {})
+            pd[injected_key] = payload
+            r = req("POST", url, data=pd, headers=headers)
+            test_url = url
+
         else:
-            r = request_with_timeout("GET", new_url, headers=headers)
-            test_url = new_url
+            params_copy = deepcopy(original_params) if original_params else {}
+            params_copy[injected_key] = [payload]
+
+            parsed = urlparse(url)
+            query = urlencode({k: v[0] for k, v in params_copy.items()}, doseq=False)
+            new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
+
+            if method.upper() == "POST":
+                r = req("POST", new_url, data=post_data, headers=headers)
+                test_url = new_url
+            else:
+                r = req("GET", new_url, headers=headers)
+                test_url = new_url
 
     if r is None:
         if verbose:
@@ -895,32 +1166,34 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
     status = r.status_code
 
     sqlerr = sqli_part.is_sql_error(text)
-    reflected = (payload in text)
+
+    # ✅ improved reflected check
+    reflected = is_reflected_payload(text, payload)
+
     len_ratio = length_change_ratio(normalize_response(base_text), normalize_response(text))
 
     vuln_type = None
     reasons = []
-    phase = None  # only set phase for SQLi error-based here
+    phase = None
 
     exploit_status = None
     phase12_extra = {}
 
     if sqlerr:
         vuln_type = "SQLi"
-        phase = "error"  # Phase7 hook for Error-based SQLi
+        phase = "error"
         reasons.append("SQL error pattern")
 
-    # XSS if payload is one of base XSS payloads and reflected
+    # keep your original logic: only treat as XSS if payload is from XSS_PAYLOADS
     if reflected and payload in xss_part.XSS_PAYLOADS:
         vuln_type = "XSS"
         reasons.append("payload reflected")
-
-        # ✅ Phase 12: CSP & security headers awareness (classification + extra)
         exploit_status, phase12_extra = _phase12_enrich_xss_fields(getattr(r, "headers", {}) or {})
 
     if len_ratio > LENGTH_DIFF_THRESHOLD and status == base_status and not vuln_type:
-        vuln_type = "Possible Injection"
-        reasons.append(f"response length changed by {len_ratio*100:.1f}%")
+        vuln_type = "SQLi"
+        phase = "heuristic"
+        reasons.append(f"heuristic length-based SQLi ({len_ratio*100:.1f}%)")
 
     if not vuln_type:
         return None
@@ -939,7 +1212,8 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
                 json_key=json_key,
                 base_text=base_text,
                 detected_type=("SQLi" if vuln_type == "SQLi" else ("XSS" if vuln_type == "XSS" else vuln_type)),
-                fingerprint=fingerprint
+                fingerprint=fingerprint,
+                request_fn=req
             )
         except Exception:
             verify_result = {"verified": False, "evidence": "verify exception", "score_delta": 0, "elapsed": 0.0}
@@ -969,43 +1243,45 @@ def _single_injection_attempt(method, url, param_name, original_params, base_tex
     if phase:
         finding["phase"] = phase
 
-    # ✅ Phase 12 fields for XSS
     if vuln_type == "XSS":
+        finding["category"] = "XSS"
+        finding["xss_subtype"] = "reflected"
+        finding["report_type"] = "Reflected XSS"
+
         if exploit_status:
             finding["exploit_status"] = exploit_status
         if phase12_extra:
             finding.setdefault("extra", {})
             finding["extra"].update(phase12_extra)
 
+    finding["severity"] = finding.get("severity") or _severity_for_finding_scanner(finding)
+
     msg = f"[VULN] {vuln_type} on {url} param/key '{finding['injected_param']}' payload: {payload} -- {finding['reason']} (score={score})"
     if finding["auto_verified"]:
         msg += " [AUTO-VERIFIED]"
     if vuln_type == "XSS" and finding.get("exploit_status"):
         msg += f" [STATUS: {finding.get('exploit_status')}]"
-        # لو بدك كمان CSP level في اللوج:
         csp_lvl = (finding.get("extra") or {}).get("csp_level")
         if csp_lvl:
             msg += f" [CSP={csp_lvl}]"
 
     log(msg)
-
     return finding
 
 
 def test_inject_all_params(method, url, params, payloads, base_text, base_status,
-                           post_data=None, headers=None, verbose=False, fingerprint=None):
-    """
-    Inject the SAME payload into ALL parameters at once.
-    """
+                           post_data=None, headers=None, verbose=False, fingerprint=None,
+                           session=None, request_fn=None):
     findings = []
     parsed = urlparse(url)
+    req = request_fn or (lambda m, u, **kw: request_with_timeout(m, u, session=session, **kw))
 
     for payload in payloads:
         params_all = {k: [payload] for k in params.keys()}
         query = urlencode({k: v[0] for k, v in params_all.items()}, doseq=False)
         new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
 
-        r = request_with_timeout("GET" if method.upper() == "GET" else "POST", new_url, data=post_data, headers=headers)
+        r = req("GET" if method.upper() == "GET" else "POST", new_url, data=post_data, headers=headers)
         if r is None:
             if verbose:
                 log(f"[DEBUG] All-params request failed for payload: {payload}")
@@ -1015,7 +1291,10 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
         status = r.status_code
 
         sqlerr = sqli_part.is_sql_error(text)
-        reflected_xss = any(pl in text for pl in xss_part.XSS_PAYLOADS)
+
+        # ✅ improved reflected check for any XSS payload
+        reflected_xss = any(is_reflected_payload(text, pl) for pl in xss_part.XSS_PAYLOADS)
+
         len_ratio = length_change_ratio(normalize_response(base_text), normalize_response(text))
 
         exploit_status = None
@@ -1038,7 +1317,10 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
                 try:
                     verify_result = verify_vuln(
                         method, url, None, params, post_data, headers,
-                        base_text=base_text, detected_type=("SQLi" if vuln_type == "SQLi" else ("XSS" if vuln_type == "XSS" else vuln_type)), fingerprint=fingerprint
+                        base_text=base_text,
+                        detected_type=("SQLi" if vuln_type == "SQLi" else ("XSS" if vuln_type == "XSS" else vuln_type)),
+                        fingerprint=fingerprint,
+                        request_fn=req
                     )
                 except Exception:
                     verify_result = {"verified": False, "evidence": "verify exception", "score_delta": 0, "elapsed": 0.0}
@@ -1064,13 +1346,18 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
             if phase:
                 f["phase"] = phase
 
-            # ✅ Phase 12 fields for XSS
             if vuln_type == "XSS":
+                f["category"] = "XSS"
+                f["xss_subtype"] = "reflected"
+                f["report_type"] = "Reflected XSS"
+
                 if exploit_status:
                     f["exploit_status"] = exploit_status
                 if phase12_extra:
                     f.setdefault("extra", {})
                     f["extra"].update(phase12_extra)
+
+            f["severity"] = f.get("severity") or _severity_for_finding_scanner(f)
 
             findings.append(f)
 
@@ -1086,7 +1373,7 @@ def test_inject_all_params(method, url, params, payloads, base_text, base_status
 
 
 # -------------------------
-# Crawling helpers (kept)
+# Crawling helpers (updated: use session)
 # -------------------------
 JS_ENDPOINT_RE = re.compile(r'["\'](/rest/[a-zA-Z0-9_/\-?=&]+)["\']')
 
@@ -1098,15 +1385,17 @@ def is_same_domain(base_url, target_url):
     except Exception:
         return False
 
-def discover_endpoints_from_js(base_url, soup, headers=None):
+def discover_endpoints_from_js(base_url, soup, headers=None, session=None):
     endpoints = []
+    s = session or requests
+
     for script in soup.find_all("script", src=True):
         src = script.get("src")
         if not src:
             continue
         js_url = urljoin(base_url, src)
         try:
-            resp = requests.get(js_url, headers=headers, timeout=TIMEOUT, verify=False, allow_redirects=True)
+            resp = s.get(js_url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
         except Exception:
             continue
         if not resp or resp.status_code != 200:
@@ -1141,11 +1430,13 @@ def add_dummy_param(url):
     new_q = urlencode({k: v[0] for k, v in q.items()}, doseq=False)
     return urlunparse(parsed._replace(query=new_q))
 
-def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
+def crawl_site(base_url, max_depth=2, max_pages=100, headers=None, session=None):
     visited = set()
     discovered = []
     queue = deque()
     queue.append((add_dummy_param(base_url), 0))
+
+    s = session or requests
 
     log(f"[*] Crawling start: {base_url} (depth={max_depth}, max_pages={max_pages})")
 
@@ -1161,7 +1452,7 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
             continue
 
         try:
-            resp = requests.get(url, headers=headers, timeout=TIMEOUT, verify=False, allow_redirects=True)
+            resp = s.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
         except Exception:
             continue
 
@@ -1179,7 +1470,6 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
         except Exception:
             continue
 
-        # Links
         for a in soup.find_all("a", href=True):
             href = a.get("href")
             if not href:
@@ -1188,7 +1478,6 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
             if is_same_domain(base_url, full_url) and full_url not in visited:
                 queue.append((full_url, depth + 1))
 
-        # GET forms
         for form in soup.find_all("form"):
             action = form.get("action") or url
             method = (form.get("method") or "GET").upper()
@@ -1212,8 +1501,7 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
                 if is_same_domain(base_url, full_url) and full_url not in visited:
                     queue.append((full_url, depth + 1))
 
-        # JS endpoints
-        js_eps = discover_endpoints_from_js(base_url, soup, headers=headers)
+        js_eps = discover_endpoints_from_js(base_url, soup, headers=headers, session=session)
         for ep in js_eps:
             ep = add_dummy_param(ep)
             if is_same_domain(base_url, ep) and ep not in visited:
@@ -1231,13 +1519,14 @@ def crawl_site(base_url, max_depth=2, max_pages=100, headers=None):
 
 
 # -------------------------
-# scan_target (clean + calls modules phases)
+# scan_target
 # -------------------------
 def scan_target(
     url,
     method="GET",
     postdata_str=None,
     headers=None,
+    session=None,
     json_str=None,
     headers_inject=False,
     inject_all_params_flag=False,
@@ -1254,16 +1543,19 @@ def scan_target(
     active_fp=False,
     xss_advanced=False,
     dom_xss=False,
-    stored_xss=False,               # ✅ Phase 11 flag
-    stored_wait=2.0,               # ✅ Phase 11 wait
-    discovered_urls=None           # ✅ Phase 11 candidate views from crawl
+    stored_xss=False,
+    stored_wait=2.0,
+    discovered_urls=None
 ):
     log(f"--- Scanning: {url} (method={method}) ---")
+
+    def req(method_, url_, **kwargs):
+        kwargs.pop("session", None)
+        return request_with_timeout(method_, url_, session=session, **kwargs)
 
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
 
-    # Parse POST data
     post_data = None
     if postdata_str:
         post_data = {}
@@ -1272,7 +1564,6 @@ def scan_target(
                 k, v = kv.split("=", 1)
                 post_data[k] = v
 
-    # Parse JSON body
     json_body = None
     if json_str:
         try:
@@ -1280,27 +1571,31 @@ def scan_target(
         except Exception as e:
             log(f"[ERROR] bad --json for {url}: {e}")
 
-    # Baseline
+    effective_params = params
+    if method.upper() == "POST" and post_data:
+        effective_params = {k: [v] for k, v in post_data.items()}
+
     base_status, base_text_raw, base_headers = baseline_response(
-        method, url, headers=headers, json_body=json_body, data=post_data
+        method, url, headers=headers, json_body=json_body, data=post_data, session=session
     )
     if base_status is None:
-        log(f"[ERROR] Baseline request failed: {url}")
+        log(f"[ERROR] Baseline request failed (no response): {url}")
         return []
+
+    if base_status in (401, 403):
+        log(f"[INFO] Baseline returned {base_status} (auth-protected endpoint) – continuing scan")
 
     base_text = normalize_response(base_text_raw)
 
-    # Fingerprint
     fingerprint = fingerprint_response(base_text_raw, base_headers)
     if verbose:
         log(f"[INFO] Fingerprint for {url}: {fingerprint}")
 
-    # Active FP (SQL)
     try:
-        if active_fp and params:
+        if active_fp and method.upper() == "GET" and params:
             db_guess, ev = sqli_part.active_db_fingerprint(
                 method, url, params,
-                request_with_timeout=request_with_timeout,
+                request_with_timeout=req,
                 headers=headers,
                 verbose=verbose,
                 log=log
@@ -1315,7 +1610,6 @@ def scan_target(
         if verbose:
             log(f"[DEBUG] Active fingerprinting error on {url}: {e}")
 
-    # Payload selection
     if combined_payloads:
         payloads = combined_payloads
     elif payloads_categories:
@@ -1327,16 +1621,14 @@ def scan_target(
 
     findings_total = []
 
-    # ✅ Phase 11 Stored XSS (runs early, uses base HTML + candidate view pages)
+    # Phase 11 Stored XSS
     try:
         if stored_xss and base_text_raw and method.upper() == "GET":
-            # only meaningful for HTML pages with forms
             ctype = (base_headers or {}).get("Content-Type", "")
             is_html = ("text/html" in (ctype or "").lower()) or ("<html" in base_text_raw.lower())
             if is_html:
                 if hasattr(xss_part, "run_stored_xss_phase") and hasattr(xss_part, "guess_view_pages"):
-                    # session shares cookies/headers for stored flows
-                    sess = requests.Session()
+                    sess = session or requests.Session()
                     if headers:
                         sess.headers.update(headers)
 
@@ -1353,9 +1645,12 @@ def scan_target(
                     )
                     if stored_findings:
                         for sf in stored_findings:
-                            # normalize keys to match reporting style
                             if isinstance(sf, dict):
-                                sf.setdefault("vuln_type", "Stored XSS")
+                                sf.setdefault("vuln_type", "XSS")
+                                sf["category"] = "XSS"
+                                sf["xss_subtype"] = "stored"
+                                sf["report_type"] = "Stored XSS"
+
                                 sf.setdefault("url", sf.get("input_url", url))
                                 sf.setdefault("test_url", sf.get("view_url", url))
                                 sf.setdefault("injected_param", ",".join(sf.get("input_fields", [])) or "[FORM]")
@@ -1365,6 +1660,8 @@ def scan_target(
                                 sf.setdefault("fingerprint", fingerprint or {})
                                 sf.setdefault("auto_verified", True)
                                 sf.setdefault("verify", {"verified": True, "evidence": sf.get("reason","stored marker found"), "score_delta": 50, "elapsed": 0.0})
+                                sf.setdefault("phase", "stored")
+                                sf["severity"] = "High"
                         findings_total.extend(stored_findings)
                 else:
                     log("[WARN] Stored XSS enabled but xss_part missing (run_stored_xss_phase/guess_view_pages). Skipping Phase 11.")
@@ -1377,28 +1674,36 @@ def scan_target(
         if dom_xss and base_text_raw:
             ctype = (base_headers or {}).get("Content-Type", "")
             if "text/html" in ctype.lower() or "<html" in base_text_raw.lower():
-                findings_total.extend(
-                    xss_part.run_dom_xss_phase(
-                        url=url,
-                        base_html=base_text_raw,
-                        TIMEOUT=TIMEOUT,
-                        headers=headers,
-                        fingerprint=fingerprint,
-                        compute_score=compute_score,
-                        log=log,
-                        now_ts=now_ts,
-                        verbose=verbose
-                    )
+                dom_findings = xss_part.run_dom_xss_phase(
+                    url=url,
+                    base_html=base_text_raw,
+                    TIMEOUT=TIMEOUT,
+                    headers=headers,
+                    fingerprint=fingerprint,
+                    compute_score=compute_score,
+                    log=log,
+                    now_ts=now_ts,
+                    verbose=verbose,
+                    session=session
                 )
+                for df in dom_findings or []:
+                    if isinstance(df, dict):
+                        df.setdefault("vuln_type", "XSS")
+                        df["category"] = "XSS"
+                        df["xss_subtype"] = "dom"
+                        df["report_type"] = "DOM XSS"
+                        df.setdefault("phase", "dom")
+                        df["severity"] = df.get("severity") or _severity_for_finding_scanner(df)
+                findings_total.extend(dom_findings or [])
     except Exception as e:
         if verbose:
             log(f"[DEBUG] DOM XSS phase error on {url}: {e}")
 
-    # Phase 1 Blind SQLi
+    # Phase 1 Blind SQLi (GET only)
     try:
         if method.upper() == "GET" and params:
             blind_phase = sqli_part.BlindBooleanSQLiPhase(
-                request_with_timeout=request_with_timeout,
+                request_with_timeout=req,
                 normalize_response=normalize_response,
                 now_ts=now_ts,
                 compute_score=compute_score,
@@ -1407,92 +1712,106 @@ def scan_target(
                 length_diff_ratio=0.15,
                 similarity_threshold=0.97
             )
-            findings_total.extend(blind_phase.run_for_url(method, url, headers=headers, fingerprint=fingerprint))
+            blind_findings = blind_phase.run_for_url(method, url, headers=headers, fingerprint=fingerprint)
+            for bf in blind_findings or []:
+                if isinstance(bf, dict):
+                    bf["severity"] = bf.get("severity") or _severity_for_finding_scanner(bf)
+            findings_total.extend(blind_findings or [])
     except Exception as e:
         if verbose:
             log(f"[DEBUG] Blind SQLi phase error on {url}: {e}")
 
     # Phase 2 Time-based SQLi
     try:
-        if time_sqli and params:
-            findings_total.extend(
-                sqli_part.run_time_based_sqli_phase(
-                    method, url, params, headers, json_body, post_data,
-                    fingerprint, time_delay, time_threshold, time_samples,
-                    request_with_timeout=request_with_timeout,
-                    compute_score=compute_score,
-                    log=log,
-                    now_ts=now_ts,
-                    verbose=verbose
-                )
+        if time_sqli and effective_params:
+            time_findings = sqli_part.run_time_based_sqli_phase(
+                method, url, effective_params, headers, json_body, post_data,
+                fingerprint, time_delay, time_threshold, time_samples,
+                request_with_timeout=req,
+                compute_score=compute_score,
+                log=log,
+                now_ts=now_ts,
+                verbose=verbose
             )
+            for tf in time_findings or []:
+                if isinstance(tf, dict):
+                    tf["severity"] = tf.get("severity") or _severity_for_finding_scanner(tf)
+            findings_total.extend(time_findings or [])
     except Exception as e:
         if verbose:
             log(f"[DEBUG] Time-based SQLi phase error on {url}: {e}")
 
-    # Phase 3b UNION extract
+    # Phase 3b UNION extract (GET only)
     try:
-        if union_extract and params:
-            findings_total.extend(
-                sqli_part.run_union_extraction_phase(
-                    method, url, params, headers, fingerprint,
-                    base_status=base_status,
-                    base_text_raw=base_text_raw,
-                    request_with_timeout=request_with_timeout,
-                    normalize_response=normalize_response,
-                    length_change_ratio=length_change_ratio,
-                    compute_score=compute_score,
-                    log=log,
-                    now_ts=now_ts,
-                    verbose=verbose
-                )
+        if union_extract and method.upper() == "GET" and params:
+            union_findings = sqli_part.run_union_extraction_phase(
+                method, url, params, headers, fingerprint,
+                base_status=base_status,
+                base_text_raw=base_text_raw,
+                request_with_timeout=req,
+                normalize_response=normalize_response,
+                length_change_ratio=length_change_ratio,
+                compute_score=compute_score,
+                log=log,
+                now_ts=now_ts,
+                verbose=verbose
             )
+            for uf in union_findings or []:
+                if isinstance(uf, dict):
+                    uf["severity"] = uf.get("severity") or _severity_for_finding_scanner(uf)
+            findings_total.extend(union_findings or [])
     except Exception as e:
         if verbose:
             log(f"[DEBUG] UNION phase error on {url}: {e}")
 
     # Phase 8 Context-aware XSS
     try:
-        if xss_context and params:
-            findings_total.extend(
-                xss_part.run_context_aware_xss_phase(
-                    method, url, params, headers, json_body, post_data,
-                    base_status, base_text, verbose,
-                    fingerprint,
-                    request_with_timeout=request_with_timeout,
-                    _single_injection_attempt=_single_injection_attempt,
-                    log=log
-                )
+        if xss_context and effective_params:
+            ctx_findings = xss_part.run_context_aware_xss_phase(
+                method, url, effective_params, headers, json_body, post_data,
+                base_status, base_text, verbose,
+                fingerprint,
+                request_with_timeout=req,
+                _single_injection_attempt=_single_injection_attempt,
+                log=log
             )
+            for xf in ctx_findings or []:
+                if isinstance(xf, dict):
+                    xf = normalize_xss_finding(xf)
+                    xf["severity"] = xf.get("severity") or _severity_for_finding_scanner(xf)
+            findings_total.extend(ctx_findings or [])
     except Exception as e:
         if verbose:
             log(f"[DEBUG] Context-aware XSS phase error on {url}: {e}")
 
     # Phase 9 Advanced reflected XSS
     try:
-        if xss_advanced and params:
-            findings_total.extend(
-                xss_part.run_advanced_reflected_xss_phase(
-                    method, url, params, headers,
-                    base_text_raw=base_text_raw,
-                    fingerprint=fingerprint,
-                    request_with_timeout=request_with_timeout,
-                    compute_score=compute_score,
-                    log=log,
-                    now_ts=now_ts,
-                    verbose=verbose
-                )
+        if xss_advanced and effective_params:
+            adv_findings = xss_part.run_advanced_reflected_xss_phase(
+                method, url, effective_params, headers,
+                base_text_raw=base_text_raw,
+                fingerprint=fingerprint,
+                request_with_timeout=req,
+                compute_score=compute_score,
+                log=log,
+                now_ts=now_ts,
+                verbose=verbose
             )
+            for af in adv_findings or []:
+                if isinstance(af, dict):
+                    af.setdefault("category", "XSS")
+                    af.setdefault("xss_subtype", "reflected")
+                    af.setdefault("report_type", "Reflected XSS")
+                    af["severity"] = af.get("severity") or _severity_for_finding_scanner(af)
+            findings_total.extend(adv_findings or [])
     except Exception as e:
         if verbose:
             log(f"[DEBUG] Advanced reflected XSS phase error on {url}: {e}")
 
-    # Header variants
     header_variants = [headers] if headers is not None else [None]
     if headers_inject:
         header_variants = generate_header_variants(headers, payloads)
 
-    # Build tasks
     tasks = []
 
     def add_param_payload_tasks(hdr, p_name, orig_params, jb=None, jkey=None):
@@ -1512,7 +1831,9 @@ def scan_target(
                     json_body=jb,
                     json_key=jkey,
                     verbose=verbose,
-                    fingerprint=fingerprint
+                    fingerprint=fingerprint,
+                    session=session,
+                    request_fn=req
                 )
             ))
 
@@ -1521,30 +1842,31 @@ def scan_target(
             for key in list(json_body.keys()):
                 add_param_payload_tasks(hdr, None, {}, jb=json_body, jkey=key)
         else:
-            if params:
-                for pname in params.keys():
-                    add_param_payload_tasks(hdr, pname, params)
-                if inject_all_params_flag:
+            if effective_params:
+                for pname in effective_params.keys():
+                    add_param_payload_tasks(hdr, pname, effective_params)
+                if inject_all_params_flag and method.upper() == "GET":
                     tasks.append((
                         "allparams",
                         dict(
                             method=method,
                             url=url,
-                            params=params,
+                            params=effective_params,
                             payloads=payloads,
                             base_text=base_text,
                             base_status=base_status,
                             post_data=post_data,
                             headers=hdr,
                             verbose=verbose,
-                            fingerprint=fingerprint
+                            fingerprint=fingerprint,
+                            session=session,
+                            request_fn=req
                         )
                     ))
             else:
                 test_param = "_scntest"
                 add_param_payload_tasks(hdr, test_param, {test_param: ["1"]})
 
-    # Execute tasks concurrently (Phase 3)
     max_workers = max(1, int(threads or 1))
     if max_workers == 1:
         for kind, kwargs in tasks:
@@ -1610,6 +1932,7 @@ def build_argparser():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--url", "-u", help="Base target URL to scan (can be combined with --crawl)")
     group.add_argument("--file", help="File with list of target URLs (one per line)")
+    parser.add_argument("--cookies", help="Cookies string, e.g. session=abc123; role=user")
 
     parser.add_argument("--method", "-m", choices=["GET", "POST"], default="GET")
     parser.add_argument("--postdata", default=None, help="POST data as key=value&k2=v2")
@@ -1628,29 +1951,23 @@ def build_argparser():
     parser.add_argument("--report-json", default="report.json")
     parser.add_argument("--report-txt", default="report.txt")
 
-    # ✅ Phase 7 SQLi report
     parser.add_argument("--report-html", action="store_true", help="Generate SQLi HTML report (Phase 7)")
     parser.add_argument("--report-html-out", default="sqli_report.html", help="SQLi HTML report output file")
 
-    # ✅ Full report (SQLi + XSS + Heuristics)
     parser.add_argument("--report-all-html", action="store_true", help="Generate FULL HTML report (SQLi + XSS + Heuristics)")
     parser.add_argument("--report-all-out", default="full_report.html", help="Full HTML report output file")
 
-    # Concurrency/throttling
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--delay", type=float, default=0.0)
     parser.add_argument("--auto-verify", action="store_true")
 
-    # Heuristics
     parser.add_argument("--len-threshold", type=float, default=0.30)
 
-    # Crawling
     parser.add_argument("--crawl", action="store_true")
     parser.add_argument("--crawl-depth", type=int, default=2)
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--save-discovered", action="store_true")
 
-    # SQLi phases
     parser.add_argument("--time-sqli", action="store_true")
     parser.add_argument("--time-delay", type=int, default=5)
     parser.add_argument("--time-threshold", type=float, default=4.0)
@@ -1658,17 +1975,24 @@ def build_argparser():
     parser.add_argument("--union-extract", action="store_true")
     parser.add_argument("--active-fp", action="store_true")
 
-    # XSS phases
     parser.add_argument("--xss-context", action="store_true")
     parser.add_argument("--xss-advanced", action="store_true")
     parser.add_argument("--dom-xss", action="store_true")
 
-    # ✅ Phase 11 Stored XSS
     parser.add_argument("--stored-xss", action="store_true", help="Enable Stored XSS Engine (Phase 11)")
     parser.add_argument("--stored-wait", type=float, default=2.0, help="Wait seconds after submitting stored payloads (default: 2.0)")
 
     return parser
 
+def parse_cookies(cookie_str):
+    cookies = {}
+    if not cookie_str:
+        return cookies
+    for part in cookie_str.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    return cookies
 
 def main():
     global TIMEOUT, REPORT_FILE, REPORT_JSON, AUTO_VERIFY, RATE_LIMITER, LENGTH_DIFF_THRESHOLD
@@ -1691,7 +2015,6 @@ def main():
     REPORT_ALL_HTML_ENABLED = bool(args.report_all_html)
     REPORT_ALL_HTML_FILE = args.report_all_out or "full_report.html"
 
-    # headers
     hdrs = {}
     if args.headers:
         for kv in args.headers.split("|"):
@@ -1699,7 +2022,12 @@ def main():
                 k, v = kv.split(":", 1)
                 hdrs[k.strip()] = v.strip()
 
-    # payloads loading
+    session = requests.Session()
+    if hdrs:
+        session.headers.update(hdrs)
+    if args.cookies:
+        session.cookies.update(parse_cookies(args.cookies))
+
     combined_payloads = None
     payloads_categories = None
 
@@ -1715,14 +2043,18 @@ def main():
             flat_count = sum(len(v) for v in payloads_categories.values())
             log(f"[*] Loaded categorized payloads ({flat_count}) from {args.payloads_json}")
 
-    # clear report
     open(REPORT_FILE, "w", encoding="utf-8").close()
 
-    # targets
     targets = []
     if args.url:
         if args.crawl:
-            targets = crawl_site(args.url, max_depth=args.crawl_depth, max_pages=args.max_pages, headers=hdrs)
+            targets = crawl_site(
+                args.url,
+                max_depth=args.crawl_depth,
+                max_pages=args.max_pages,
+                headers=hdrs,
+                session=session
+            )
             if args.save_discovered and targets:
                 try:
                     with open("discovered_urls.txt", "w", encoding="utf-8") as f:
@@ -1750,6 +2082,7 @@ def main():
                 method=args.method,
                 postdata_str=args.postdata,
                 headers=hdrs,
+                session=session,
                 json_str=args.json,
                 headers_inject=args.headers_inject,
                 inject_all_params_flag=args.inject_all_params,
@@ -1766,11 +2099,9 @@ def main():
                 active_fp=args.active_fp,
                 xss_advanced=args.xss_advanced,
                 dom_xss=args.dom_xss,
-
-                # ✅ Phase 11 Stored XSS
                 stored_xss=args.stored_xss,
                 stored_wait=args.stored_wait,
-                discovered_urls=targets  # use crawl list as view candidates
+                discovered_urls=targets
             )
             all_findings.extend(f or [])
         except KeyboardInterrupt:
@@ -1780,15 +2111,34 @@ def main():
             log(f"[DEBUG] target error: {e}")
 
     elapsed = time.time() - start
-    log(f"Scan finished in {elapsed:.2f}s. Findings: {len(all_findings)}")
 
-    # ✅ Phase 7: enrich SQLi findings only (no SQLi classification in scanner.py)
+    # -------------------------
+    # DEDUP + Enrich + Aggregation
+    # -------------------------
+    all_findings = [f for f in all_findings if isinstance(f, dict)]
+
+    # 0) Normalize XSS labels BEFORE dedup/summary so report.json shows Stored/DOM
+    all_findings = normalize_all_findings(all_findings)
+
+    # ✅ Ensure labeling is applied for any XSS-like finding (hard guarantee)
+    for f in all_findings:
+        if _is_xss_finding(f):
+            normalize_xss_finding(f)
+
+    # 1) Dedup
+    uniq, removed = dedup_findings(all_findings)
+    all_findings = uniq
+    if removed:
+        log(f"[*] Dedup removed {removed} duplicate findings")
+
+    # 2) SQLi enrichment (Phase 7 from sqli_part.py)
     try:
         sqli_only = [f for f in all_findings if _is_sqli_finding(f)]
         enriched_sqli = sqli_part.enrich_sqli_findings_list(sqli_only)
 
         def _key(d):
             return (d.get("url"), d.get("injected_param"), d.get("payload"), d.get("test_url"), d.get("phase"))
+
         enriched_map = {_key(x): x for x in enriched_sqli if isinstance(x, dict)}
 
         for i, f in enumerate(all_findings):
@@ -1797,28 +2147,49 @@ def main():
             k = _key(f)
             if k in enriched_map:
                 all_findings[i].update(enriched_map[k])
-
     except Exception as e:
         log(f"[DEBUG] Phase7 enrich failed: {e}")
 
-    # write JSON report
+    # 2.5) Normalize again (in case enrichment overwrote fields)
+    all_findings = normalize_all_findings(all_findings)
+
+    # ✅ Ensure labeling again after enrichment (hard guarantee)
+    for f in all_findings:
+        if _is_xss_finding(f):
+            normalize_xss_finding(f)
+
+    # 3) Ensure severity on all + page aggregation
+    for f in all_findings:
+        if "severity" not in f or not f.get("severity"):
+            f["severity"] = _severity_for_finding_scanner(f)
+
+    pages = aggregate_page_risk(all_findings)
+    summary = compute_summary(all_findings)
+
+    log(f"Scan finished in {elapsed:.2f}s. Findings(unique): {len(all_findings)} | Verified: {summary.get('verified',0)}")
+    log(f"Pages affected: {len(pages)}")
+
+    # -------------------------
+    # JSON Report (with summary + pages)
+    # -------------------------
     try:
         with open(REPORT_JSON, "w", encoding="utf-8") as jf:
             _json.dump({
                 "generated_at": now_ts(),
                 "targets_scanned": len(targets),
+                "elapsed_sec": round(elapsed, 3),
                 "findings_count": len(all_findings),
+                "summary": summary,
+                "pages": pages,
                 "findings": all_findings
             }, jf, indent=2, ensure_ascii=False)
         log(f"Structured JSON report saved to {REPORT_JSON}")
     except Exception as e:
         log(f"[ERROR] Could not write JSON report: {e}")
 
-    # ✅ SQLi-only report (Phase 7)
     if REPORT_HTML_ENABLED:
         generate_sqli_html_report(all_findings, output_file=REPORT_HTML_FILE)
 
-    # ✅ Full report (SQLi + XSS + Heuristics)
     if REPORT_ALL_HTML_ENABLED:
         generate_full_html_report(all_findings, output_file=REPORT_ALL_HTML_FILE)
 
