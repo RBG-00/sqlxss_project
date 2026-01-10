@@ -1,6 +1,0 @@
---- Scanning: http://localhost:3000/rest/products/search?q=test (method=GET) ---
-[INFO] Fingerprint for http://localhost:3000/rest/products/search?q=test: {'server': None, 'language': 'php', 'database': None, 'evidence': ['language:php matched /\\bphp\\b/']}
-[TIME] Baseline avg for http://localhost:3000/rest/products/search?q=test: 0.201s (samples=3)
-[UNION] Trying UNION phase on http://localhost:3000/rest/products/search?q=test param q
-[UNION] ORDER BY 1 failed for http://localhost:3000/rest/products/search?q=test%27+ORDER+BY+1--+-
-Scan finished in 5.86s. Findings: 0
