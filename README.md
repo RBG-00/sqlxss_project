@@ -55,8 +55,7 @@ sqlxss-scanner/
 ├── full_report.html
 └── .gitignore
 
-yaml
-Copy code
+
 
 > Note: Report files are generated outputs and are included only as examples of scanner results.
 
@@ -86,13 +85,11 @@ pip install -r requirements.txt
 Usage Example
 Scan a target web application:
 
-bash
-Copy code
+
 python3 scanner.py -u http://127.0.0.1:3000
 Scan a specific endpoint:
 
-bash
-Copy code
+
 python3 scanner.py -u "http://127.0.0.1:3000/rest/products/search?q=test"
 Verification Strategy
 Unlike basic scanners, this project applies multiple verification techniques, including:
@@ -152,5 +149,4 @@ Mohammad Samada
 Cybersecurity Student | Web Application Security
 SQL Injection & XSS Detection and Verification
 
-markdown
-Copy code
+
