@@ -149,7 +149,7 @@ Scanning systems without explicit permission is strictly prohibited.
 The author is not responsible for any misuse of this tool.
 
 ## Author
-# Mohammad Samada
+ Mohammad Samada
 Cybersecurity Student | Web Application Security
 SQL Injection & XSS Detection and Verification
 
