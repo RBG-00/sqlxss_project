@@ -87,13 +87,14 @@ pip install -r requirements.txt
 ## Usage Example
 Scan a target web application:
 
-
+```bash
 python3 scanner.py -u http://127.0.0.1:3000
+```
 Scan a specific endpoint:
-
-
+```bash
 python3 scanner.py -u "http://127.0.0.1:3000/rest/products/search?q=test"
-Verification Strategy
+```
+## Verification Strategy
 Unlike basic scanners, this project applies multiple verification techniques, including:
 
 Response length and similarity comparison
@@ -108,7 +109,7 @@ Decode-aware payload inspection
 
 These mechanisms significantly reduce false positives and increase confidence in reported vulnerabilities.
 
-Recommended Testing Environment
+## Recommended Testing Environment
 This scanner must be used only in controlled and authorized environments, such as:
 
 Local Docker-based vulnerable applications
@@ -119,17 +120,18 @@ Self-hosted test servers
 
 Example using OWASP Juice Shop:
 
-bash
-Copy code
+```bash
 docker run --rm -p 3000:3000 bkimminich/juice-shop
-Limitations
+```
+## Limitations
+
 DOM XSS detection is static and does not execute JavaScript
 
 Stored XSS detection depends on discoverable forms and view pages
 
 Advanced WAF bypass techniques are intentionally excluded
 
-Future Improvements
+## Future Improvements
 Headless browser integration for DOM XSS confirmation
 
 Enhanced crawling and form discovery
@@ -138,7 +140,7 @@ Advanced SQL Injection bypass techniques
 
 Unified vulnerability report dashboard
 
-Legal Disclaimer
+## Legal Disclaimer
 ⚠️ Important Notice
 
 This project is developed for educational and authorized security testing purposes only.
@@ -146,8 +148,8 @@ Scanning systems without explicit permission is strictly prohibited.
 
 The author is not responsible for any misuse of this tool.
 
-Author
-Mohammad Samada
+## Author
+# Mohammad Samada
 Cybersecurity Student | Web Application Security
 SQL Injection & XSS Detection and Verification
 
