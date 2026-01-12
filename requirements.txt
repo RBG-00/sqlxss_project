@@ -1,31 +1,3 @@
-# === Core functionality ===
-requests>=2.31.0        # لإرسال الطلبات HTTP (scanner الأساسي)
-urllib3>=2.2.0          # يأتي عادة مع requests لكن نثبته لتأكيد التوافق
-
-# === Web test server (Phase 4 & testing) ===
-flask>=2.2.5            # لتشغيل test_server المحلي
-Werkzeug>=2.2.3         # dependency أساسي لـ Flask
-Jinja2>=3.1.2           # dependency أساسي لـ Flask
-itsdangerous>=2.1.2     # dependency أساسي لـ Flask
-
-# === Concurrency and data handling ===
-tqdm>=4.66.0            # (اختياري) يمكن استعماله لشريط تقدم في المراحل القادمة
-colorama>=0.4.6         # (اختياري) لألوان في CLI عند الطباعة
-
-# === Testing & CI ===
-pytest>=7.0.0           # لتشغيل اختبارات الوحدات والدمج
-pytest-cov>=4.1.0       # لتغطية الاختبارات (اختياري)
-requests-mock>=1.10.0   # لتجارب unit بدون اتصال حقيقي (اختياري)
-
-# === Dev utilities (اختيارية للتطوير فقط) ===
-black>=23.0.0           # تنسيق الكود
-flake8>=6.1.0           # تحليل جودة الكود
-
-
-
-beautifulsoup4>=4.12
-lxml
-playwright
 
 requests>=2.31.0
 beautifulsoup4>=4.12.0
