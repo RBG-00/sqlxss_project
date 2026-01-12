@@ -82,8 +82,9 @@ This architecture allows independent development and testing of SQLi and XSS com
 
 ```bash
 pip install -r requirements.txt
+```
 
-##Usage Example
+## Usage Example
 Scan a target web application:
 
 
