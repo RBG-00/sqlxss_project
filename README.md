@@ -42,7 +42,7 @@ By analyzing response stability, similarity, timing behavior, and execution cont
 ---
 
 ## Repository Structure
-
+```
 sqlxss-scanner/
 ├── scanner.py # Main scanner orchestrator
 ├── sqli_part.py # SQL Injection detection and verification engine
@@ -54,7 +54,7 @@ sqlxss-scanner/
 ├── report.txt
 ├── full_report.html
 └── .gitignore
-
+```
 
 
 > Note: Report files are generated outputs and are included only as examples of scanner results.
